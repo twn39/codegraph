@@ -141,74 +141,141 @@ def resolve_local_binding(ctx: ResolutionContext) -> str | _StopResolution | Non
     return result if result else STOP
 
 
+def _normalize_type_name(type_name: str) -> str:
+    """Strip constructor call syntax and generic noise from a binding type."""
+    name = type_name.strip()
+    if name.endswith("()"):
+        name = name[:-2].strip()
+    # Drop simple generic args: List[Foo] → keep as-is for id lookup; Foo[T] → Foo
+    if "[" in name:
+        name = name.split("[", 1)[0].strip()
+    # Prefer trailing segment: pkg.mod.Client → Client for label search
+    if "." in name and name not in ("",):
+        # Keep full string for node-id match first; callers try both
+        pass
+    return name
+
+
+def _lookup_class_id(
+    receiver_type: str,
+    *,
+    source_file: str,
+    scope,
+    node_ids,
+    graph_nodes,
+    strategy,
+) -> str | None:
+    """Resolve a type name / node id to a class-like graph node id."""
+    candidates = [receiver_type, _normalize_type_name(receiver_type)]
+    short = _normalize_type_name(receiver_type).rsplit(".", 1)[-1]
+    if short not in candidates:
+        candidates.append(short)
+
+    for cand in candidates:
+        if cand in node_ids:
+            return cand
+        file_local = f"{source_file}::{cand}"
+        if file_local in node_ids:
+            return file_local
+
+    for cand in candidates:
+        if cand in scope.imported_symbols:
+            target_file_id, original_name = scope.imported_symbols[cand]
+            class_id = f"{target_file_id}::{original_name}"
+            if class_id in node_ids:
+                return class_id
+
+    if strategy.has_package_sibling_scope():
+        caller_dir = Path(source_file).parent
+        for cand in candidates:
+            for nid in node_ids:
+                ndata = graph_nodes[nid]
+                if (
+                    ndata.get("type") in ("class", "struct", "interface", "enum")
+                    and ndata.get("label") == cand
+                ):
+                    node_file = ndata.get("source_file", "")
+                    if node_file and Path(node_file).parent == caller_dir:
+                        return nid
+
+    for cand in candidates:
+        for nid in node_ids:
+            ndata = graph_nodes[nid]
+            if (
+                ndata.get("type") in ("class", "struct", "interface", "enum")
+                and ndata.get("label") == cand
+            ):
+                return nid
+    return None
+
+
+def _find_method_on_class(
+    resolved_class_id: str,
+    method_name: str,
+    rest_of_callee: str,
+    *,
+    node_ids,
+    graph_nodes,
+    receiver_type: str,
+) -> str | None:
+    """Locate a method/function node belonging to *resolved_class_id*."""
+    for candidate in (
+        f"{resolved_class_id}.{rest_of_callee}",
+        f"{resolved_class_id}.{method_name}",
+    ):
+        if candidate in node_ids:
+            return candidate
+
+    class_label = graph_nodes[resolved_class_id].get("label", "")
+    type_norm = _normalize_type_name(receiver_type)
+    short_type = type_norm.rsplit(".", 1)[-1]
+
+    for nid in node_ids:
+        ndata = graph_nodes[nid]
+        if ndata.get("type") not in ("method", "function"):
+            continue
+        if ndata.get("label") != method_name:
+            continue
+        parent_class_part = nid.rsplit(".", 1)[0] if "." in nid else ""
+        if parent_class_part == resolved_class_id:
+            return nid
+        parent_class_name = (
+            parent_class_part.rsplit("::", 1)[-1]
+            if "::" in parent_class_part
+            else parent_class_part
+        )
+        if parent_class_name in {class_label, type_norm, short_type, receiver_type}:
+            return nid
+        if parent_class_name.endswith(f".{short_type}") or parent_class_name.endswith(
+            f".{class_label}"
+        ):
+            return nid
+    return None
+
+
 def _resolve_local_binding_impl(ctx: ResolutionContext) -> str | None:
     receiver_type = ctx.local_bindings[ctx.main_symbol]
-    source_file = ctx.source_file
-    scope = ctx.scope
-    node_ids = ctx.node_ids
-    graph_nodes = ctx.graph_nodes
-    rest_of_callee = ctx.rest_of_callee
     parts = ctx.parts
 
-    resolved_class_id: str | None = None
-
-    if receiver_type in node_ids:
-        resolved_class_id = receiver_type
-    elif f"{source_file}::{receiver_type}" in node_ids:
-        resolved_class_id = f"{source_file}::{receiver_type}"
-    elif receiver_type in scope.imported_symbols:
-        target_file_id, original_name = scope.imported_symbols[receiver_type]
-        resolved_class_id = f"{target_file_id}::{original_name}"
-    elif ctx.strategy.has_package_sibling_scope():
-        caller_dir = Path(source_file).parent
-        for nid in node_ids:
-            ndata = graph_nodes[nid]
-            if (
-                ndata.get("type") in ("class", "struct", "interface", "enum")
-                and ndata.get("label") == receiver_type
-            ):
-                node_file = ndata.get("source_file", "")
-                if node_file and Path(node_file).parent == caller_dir:
-                    resolved_class_id = nid
-                    break
-
-    # Fallback: search entire graph for the class/struct definition
+    resolved_class_id = _lookup_class_id(
+        receiver_type,
+        source_file=ctx.source_file,
+        scope=ctx.scope,
+        node_ids=ctx.node_ids,
+        graph_nodes=ctx.graph_nodes,
+        strategy=ctx.strategy,
+    )
     if not resolved_class_id:
-        for nid in node_ids:
-            ndata = graph_nodes[nid]
-            if (
-                ndata.get("type") in ("class", "struct", "interface", "enum")
-                and ndata.get("label") == receiver_type
-            ):
-                resolved_class_id = nid
-                break
+        return None
 
-    if resolved_class_id:
-        target_method_id = f"{resolved_class_id}.{rest_of_callee}"
-        if target_method_id in node_ids:
-            return target_method_id
-        target_method_id = f"{resolved_class_id}.{parts[-1]}"
-        if target_method_id in node_ids:
-            return target_method_id
-
-        method_name = parts[-1]
-        for nid in node_ids:
-            ndata = graph_nodes[nid]
-            if (
-                ndata.get("type") in ("method", "function")
-                and ndata.get("label") == method_name
-            ):
-                parent_class_part = nid.rsplit(".", 1)[0] if "." in nid else ""
-                parent_class_name = (
-                    parent_class_part.rsplit("::", 1)[-1]
-                    if "::" in parent_class_part
-                    else parent_class_part
-                )
-                if parent_class_name == receiver_type or parent_class_name.endswith(
-                    f".{receiver_type}"
-                ):
-                    return nid
-    return None
+    return _find_method_on_class(
+        resolved_class_id,
+        parts[-1],
+        ctx.rest_of_callee,
+        node_ids=ctx.node_ids,
+        graph_nodes=ctx.graph_nodes,
+        receiver_type=receiver_type,
+    )
 
 
 # ---------------------------------------------------------------------------

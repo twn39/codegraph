@@ -1,8 +1,17 @@
 import logging
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class WriteStats:
+    written: int = 0
+    skipped: int = 0
+    removed: int = 0
+    paths_written: list[str] = field(default_factory=list)
 
 
 class VaultWriter:
@@ -15,17 +24,23 @@ class VaultWriter:
             except Exception as e:
                 logger.warning(f"Could not fully clear output directory {path}: {e}")
 
-    def write_file(self, path: Path, content: str):
-        """Helper to write content to a file."""
+    def write_file(self, path: Path, content: str, stats: WriteStats | None = None) -> bool:
+        """Write content if changed. Returns True when a write occurred."""
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists():
                 try:
                     if path.read_text(encoding="utf-8") == content:
-                        return
+                        if stats is not None:
+                            stats.skipped += 1
+                        return False
                 except Exception:
                     pass
             path.write_text(content, encoding="utf-8")
+            if stats is not None:
+                stats.written += 1
+                stats.paths_written.append(str(path))
+            return True
         except Exception as e:
             logger.error(f"Failed to write file at {path}: {e}")
             raise
@@ -37,8 +52,9 @@ class VaultWriter:
         rendered_components: dict[str, str],
         readme_content: str,
         prompt_content: str,
-    ):
-        """Writes all rendered markdown pages to their respective directories."""
+    ) -> WriteStats:
+        """Writes all rendered markdown pages; skips unchanged files."""
+        stats = WriteStats()
         nodes_dir = output_dir / "nodes"
         comps_dir = output_dir / "components"
 
@@ -52,6 +68,7 @@ class VaultWriter:
                 if p.name not in expected_nodes:
                     try:
                         p.unlink()
+                        stats.removed += 1
                         logger.info(f"Removed obsolete node file: {p.name}")
                     except Exception as e:
                         logger.warning(f"Could not remove obsolete node file {p.name}: {e}")
@@ -62,23 +79,21 @@ class VaultWriter:
                 if p.name not in expected_components:
                     try:
                         p.unlink()
+                        stats.removed += 1
                         logger.info(f"Removed obsolete component file: {p.name}")
                     except Exception as e:
                         logger.warning(f"Could not remove obsolete component file {p.name}: {e}")
 
-        # 1. Write Node Pages
         for fname, content in rendered_nodes.items():
-            self.write_file(nodes_dir / fname, content)
+            self.write_file(nodes_dir / fname, content, stats)
 
-        # 2. Write Component Pages
         for fname, content in rendered_components.items():
-            self.write_file(comps_dir / fname, content)
+            self.write_file(comps_dir / fname, content, stats)
 
-        # 3. Write README.md and AGENT_PROMPT.md
-        self.write_file(output_dir / "README.md", readme_content)
-        self.write_file(output_dir / "AGENT_PROMPT.md", prompt_content)
+        self.write_file(output_dir / "README.md", readme_content, stats)
+        self.write_file(output_dir / "AGENT_PROMPT.md", prompt_content, stats)
 
-        # 4. Write AGENTS.md to root
+        # 4. Write AGENTS.md to project root
         project_root = output_dir.parent
         agents_file = project_root / "AGENTS.md"
 
@@ -108,7 +123,7 @@ You MUST follow these rules when working in this codebase:
                 content = agents_file.read_text(encoding="utf-8")
                 if "## codegraph-gen" not in content:
                     new_content = content.rstrip() + "\n\n" + agents_rule_body
-                    self.write_file(agents_file, new_content)
+                    self.write_file(agents_file, new_content, stats)
                     logger.info(
                         "Appended codegraph-gen rules to existing AGENTS.md at root"
                     )
@@ -116,7 +131,15 @@ You MUST follow these rules when working in this codebase:
                 logger.warning(f"Could not read or append to existing AGENTS.md: {e}")
         else:
             try:
-                self.write_file(agents_file, agents_rule_body)
+                self.write_file(agents_file, agents_rule_body, stats)
                 logger.info("Created new AGENTS.md with codegraph rules at root")
             except Exception as e:
                 logger.warning(f"Could not create AGENTS.md at root: {e}")
+
+        logger.info(
+            "Vault write: %s written, %s unchanged, %s removed",
+            stats.written,
+            stats.skipped,
+            stats.removed,
+        )
+        return stats

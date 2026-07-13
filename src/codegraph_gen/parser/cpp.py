@@ -5,60 +5,24 @@ from codegraph_gen.parser.base import (
     BaseParser,
     ASTVisitor,
     ASTParsingContext,
-    get_node_text,
-    get_line_range,
     register_parser,
 )
+from codegraph_gen.parser.common import VisitorMixin
 from codegraph_gen.schema import (
     ExtractionResult,
     NodeSchema,
-    EdgeSchema,
 )
 
 logger = logging.getLogger(__name__)
 
 
-class CCppVisitor:
+class CCppVisitor(VisitorMixin):
     traverser: ASTVisitor
 
     def __init__(self, ctx: ASTParsingContext, parser):
-        self.ctx = ctx
-        self.parser = parser
+        super().__init__(ctx, parser)
         self.file_node_id = ctx.rel_path
         self.defined_ids = {ctx.rel_path}
-
-    def get_text(self, node: tree_sitter.Node) -> str:
-        return get_node_text(node, self.ctx.source)
-
-    def get_line_range(self, node: tree_sitter.Node) -> tuple[int, int]:
-        return get_line_range(node)
-
-    def get_current_parent_id(self) -> str:
-        return self.ctx.scope.current_id
-
-    def add_node(self, node: NodeSchema) -> None:
-        self.ctx.add_node(node)
-
-    def add_edge(self, edge: EdgeSchema) -> None:
-        self.ctx.add_edge(edge)
-
-    @property
-    def scope(self):
-        return self.ctx.scope
-
-    @property
-    def source(self):
-        return self.ctx.source
-
-    @property
-    def rel_path(self):
-        return self.ctx.rel_path
-
-    def generic_visit(self, node: tree_sitter.Node) -> None:
-        self.traverser.generic_visit(node)
-
-    def visit(self, node: tree_sitter.Node) -> None:
-        self.traverser.visit(node)
 
     def visit_class_specifier(self, node: tree_sitter.Node) -> None:
         self._visit_specifier(node, "class_specifier")
@@ -111,24 +75,16 @@ class CCppVisitor:
         elif node_type == "namespace_definition":
             sym_type = "namespace"
 
-        start_line, end_line = self.get_line_range(node)
-        self.add_node(
-            NodeSchema(
-                id=symbol_id,
-                label=name,
-                type=sym_type,
-                source_file=self.rel_path,
-                line_start=start_line,
-                line_end=end_line,
-                signature=self.parser._get_signature(node, self.source),
-                docstring=self.parser._get_docstring(node, self.source),
-            )
+        self.emit_symbol(
+            node=node,
+            name=name,
+            sym_type=sym_type,
+            symbol_id=symbol_id,
+            parent_id=parent_id,
+            signature=self.parser._get_signature(node, self.source),
+            docstring=self.parser._get_docstring(node, self.source),
         )
         self.defined_ids.add(symbol_id)
-
-        self.add_edge(
-            EdgeSchema(source=parent_id, target=symbol_id, relation="contains")
-        )
 
         # Handle base classes inheritance
         for child in node.children:
@@ -150,13 +106,7 @@ class CCppVisitor:
                 for sub in child.children:
                     base_name = extract_base_types(sub)
                     if base_name:
-                        self.add_edge(
-                            EdgeSchema(
-                                source=symbol_id,
-                                target=base_name,
-                                relation="inherits",
-                            )
-                        )
+                        self.emit_relation(symbol_id, base_name, "inherits")
 
         with self.scope.push(symbol_id, sym_type):
             self.generic_visit(node)
@@ -175,44 +125,28 @@ class CCppVisitor:
                 method_id = f"{class_id}.{method_part}"
                 sym_type = "method"
                 func_label = method_part
-
-                actual_parent = (
+                contains_parent = (
                     class_id if class_id in self.defined_ids else self.file_node_id
-                )
-                self.add_edge(
-                    EdgeSchema(
-                        source=actual_parent,
-                        target=method_id,
-                        relation="contains",
-                    )
                 )
             elif parent_type in ("class", "struct", "union", "namespace"):
                 method_id = f"{parent_id}.{func_name}"
                 sym_type = "method" if parent_type != "namespace" else "function"
                 func_label = func_name
-                self.add_edge(
-                    EdgeSchema(source=parent_id, target=method_id, relation="contains")
-                )
+                contains_parent = parent_id
             else:
                 method_id = f"{self.rel_path}::{func_name}"
                 sym_type = "function"
                 func_label = func_name
-                self.add_edge(
-                    EdgeSchema(source=parent_id, target=method_id, relation="contains")
-                )
+                contains_parent = parent_id
 
-            start_line, end_line = self.get_line_range(node)
-            self.add_node(
-                NodeSchema(
-                    id=method_id,
-                    label=func_label,
-                    type=sym_type,
-                    source_file=self.rel_path,
-                    line_start=start_line,
-                    line_end=end_line,
-                    signature=self.parser._get_signature(node, self.source),
-                    docstring=self.parser._get_docstring(node, self.source),
-                )
+            self.emit_symbol(
+                node=node,
+                name=func_label,
+                sym_type=sym_type,
+                symbol_id=method_id,
+                parent_id=contains_parent,
+                signature=self.parser._get_signature(node, self.source),
+                docstring=self.parser._get_docstring(node, self.source),
             )
             self.defined_ids.add(method_id)
 
@@ -230,11 +164,7 @@ class CCppVisitor:
                     break
         if path_node:
             include_path = self.get_text(path_node).strip('"<>')
-            self.add_edge(
-                EdgeSchema(
-                    source=self.file_node_id, target=include_path, relation="imports"
-                )
-            )
+            self.emit_relation(self.file_node_id, include_path, "imports")
         self.generic_visit(node)
 
     def visit_call_expression(self, node: tree_sitter.Node) -> None:
@@ -242,9 +172,7 @@ class CCppVisitor:
         if func_node:
             callee_name = self.get_text(func_node)
             caller_id = self.get_current_parent_id()
-            self.add_edge(
-                EdgeSchema(source=caller_id, target=callee_name, relation="calls")
-            )
+            self.emit_relation(caller_id, callee_name, "calls")
         self.generic_visit(node)
 
 

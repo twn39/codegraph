@@ -72,6 +72,46 @@ def cli():
     default=True,
     help="Enable/disable incremental parsing cache.",
 )
+@click.option(
+    "--export-json/--no-export-json",
+    default=True,
+    help="Write graph.json machine-readable export in the vault output directory.",
+)
+@click.option(
+    "--exclude-tests-from-clustering/--include-tests-in-clustering",
+    default=None,
+    help="Exclude (default) or include test-path nodes in Louvain clustering.",
+)
+@click.option(
+    "--component-naming",
+    type=click.Choice(["hybrid", "package", "symbol"], case_sensitive=False),
+    default=None,
+    help="Component naming strategy: hybrid (default), package, or symbol.",
+)
+@click.option(
+    "--min-resolve-rate",
+    type=float,
+    default=None,
+    help="CI gate: fail if overall edge resolve rate is below this value (0.0–1.0).",
+)
+@click.option(
+    "--max-unresolved-edges",
+    type=int,
+    default=None,
+    help="CI gate: fail if overall unresolved edge count exceeds this value.",
+)
+@click.option(
+    "--min-internal-resolve-rate",
+    type=float,
+    default=None,
+    help="CI gate: fail if *internal* edge resolve rate is below this (0.0–1.0).",
+)
+@click.option(
+    "--max-internal-unresolved-edges",
+    type=int,
+    default=None,
+    help="CI gate: fail if unresolved *internal* edge count exceeds this value.",
+)
 def build(
     src_dir: Path,
     output: Path,
@@ -79,6 +119,13 @@ def build(
     parallel: bool,
     workers: int | None,
     cache: bool,
+    export_json: bool,
+    exclude_tests_from_clustering: bool | None,
+    component_naming: str | None,
+    min_resolve_rate: float | None,
+    max_unresolved_edges: int | None,
+    min_internal_resolve_rate: float | None,
+    max_internal_unresolved_edges: int | None,
 ):
     """Parses the codebase in SRC_DIR and exports the Markdown graph vault."""
     console.print("[bold blue]Starting codegraph analysis...[/bold blue]")
@@ -168,6 +215,60 @@ def build(
         if parts:
             console.print(f"[dim]   {' | '.join(parts)}[/dim]")
 
+    # Clustering / quality options: CLI overrides .codegraphrc, else defaults
+    effective_exclude_tests = (
+        exclude_tests_from_clustering
+        if exclude_tests_from_clustering is not None
+        else (
+            project_cfg.exclude_tests_from_clustering
+            if project_cfg is not None
+            else True
+        )
+    )
+    effective_naming = (
+        component_naming
+        if component_naming is not None
+        else (project_cfg.component_naming if project_cfg is not None else "hybrid")
+    ).lower()
+    effective_min_rate = (
+        min_resolve_rate
+        if min_resolve_rate is not None
+        else (project_cfg.min_resolve_rate if project_cfg is not None else None)
+    )
+    effective_max_unresolved = (
+        max_unresolved_edges
+        if max_unresolved_edges is not None
+        else (project_cfg.max_unresolved_edges if project_cfg is not None else None)
+    )
+    effective_min_internal_rate = (
+        min_internal_resolve_rate
+        if min_internal_resolve_rate is not None
+        else (
+            project_cfg.min_internal_resolve_rate
+            if project_cfg is not None
+            else None
+        )
+    )
+    effective_max_internal_unresolved = (
+        max_internal_unresolved_edges
+        if max_internal_unresolved_edges is not None
+        else (
+            project_cfg.max_internal_unresolved_edges
+            if project_cfg is not None
+            else None
+        )
+    )
+
+    for label, rate in (
+        ("--min-resolve-rate", effective_min_rate),
+        ("--min-internal-resolve-rate", effective_min_internal_rate),
+    ):
+        if rate is not None and not (0.0 <= rate <= 1.0):
+            console.print(
+                f"[bold red]Error:[/bold red] {label} must be between 0.0 and 1.0"
+            )
+            raise SystemExit(2)
+
     config = CodegraphConfig(
         workspace_dir=workspace,
         output_dir=resolved_output,
@@ -176,6 +277,13 @@ def build(
         max_workers=max_workers,
         use_cache=effective_cache,
         include_dirs=include_dirs,
+        export_json=export_json,
+        exclude_tests_from_clustering=effective_exclude_tests,
+        component_naming=effective_naming,
+        min_resolve_rate=effective_min_rate,
+        max_unresolved_edges=effective_max_unresolved,
+        min_internal_resolve_rate=effective_min_internal_rate,
+        max_internal_unresolved_edges=effective_max_internal_unresolved,
     )
 
     from codegraph_gen.engine import CodegraphEngine, PipelineStage
@@ -216,7 +324,12 @@ def build(
             elif stage == PipelineStage.COMPLETED:
                 progress.update(task, description="Done!")
 
-        result = engine.run_pipeline(config, progress_callback=progress_callback)
+        try:
+            result = engine.run_pipeline(config, progress_callback=progress_callback)
+        except RuntimeError as e:
+            progress.update(task, description="Failed quality gate")
+            console.print(f"[bold red]Quality gate failed:[/bold red] {e}")
+            raise SystemExit(1) from e
 
     G = result.graph
     if G.number_of_nodes() == 0:
@@ -232,6 +345,48 @@ def build(
     )
     console.print(f"  - Files: {files_count}")
     console.print(f"  - Symbols (Classes/Functions/Methods): {symbols_count}")
+
+    if result.analysis.resolution is not None:
+        res = result.analysis.resolution
+        console.print(
+            f"  - Edge resolution: [green]{res.resolved}[/green]/{res.attempted} "
+            f"([cyan]{100.0 * res.resolve_rate:.1f}%[/cyan]), unresolved={res.unresolved}"
+        )
+        console.print(
+            f"  - Internal resolution: [green]{res.internal_resolved}[/green]/"
+            f"{res.internal_attempted} "
+            f"([cyan]{100.0 * res.internal_resolve_rate:.1f}%[/cyan]), "
+            f"internal_unresolved={res.internal_unresolved}"
+        )
+        console.print(
+            f"  - Unresolved by category: external={res.category_unresolved('external')}, "
+            f"builtin={res.category_unresolved('builtin')}, "
+            f"attribute={res.category_unresolved('attribute')}, "
+            f"internal={res.category_unresolved('internal')}"
+        )
+
+    write_stats = G.graph.get("vault_write_stats")
+    if write_stats:
+        console.print(
+            f"  - Vault write: written={write_stats.get('written', 0)}, "
+            f"skipped={write_stats.get('skipped', 0)}, removed={write_stats.get('removed', 0)}"
+        )
+
+    render_stats = G.graph.get("render_stats")
+    if render_stats:
+        console.print(
+            f"  - Incremental render: nodes "
+            f"{render_stats.get('nodes_rendered', 0)} rendered / "
+            f"{render_stats.get('nodes_reused', 0)} reused; components "
+            f"{render_stats.get('components_rendered', 0)} / "
+            f"{render_stats.get('components_reused', 0)} "
+            f"(dirty_files={render_stats.get('dirty_files', 0)})"
+        )
+
+    if export_json:
+        console.print(
+            f"  - JSON export: [underline]{config.absolute_output_dir / 'graph.json'}[/underline]"
+        )
 
     console.print(
         "[bold green]Success! Codebase knowledge graph built successfully.[/bold green]"
@@ -469,7 +624,7 @@ def info():
     """Prints tool info and supported languages."""
     console.print(f"[bold]codegraph v{__version__}[/bold]")
     console.print(
-        "Supported languages: Python, JavaScript, TypeScript, Kotlin, Go, Rust, Swift, C, C++"
+        "Supported languages: Python, JavaScript, TypeScript, Kotlin, Go, Rust, Swift, C, C++, OCaml"
     )
 
 

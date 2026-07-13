@@ -82,7 +82,10 @@ class WorklistFixpointSolver:
                 continue
 
             bound_name = local_bindings[var_name]
-            if not isinstance(bound_name, str) or bound_name in self.resolver.node_ids:
+            if not isinstance(bound_name, str):
+                continue
+            # Already a concrete graph node id — still normalize constructor forms
+            if bound_name in self.resolver.node_ids:
                 continue
 
             new_target_type = self._evaluate_variable(nid, var_name, bound_name)
@@ -103,7 +106,29 @@ class WorklistFixpointSolver:
                 return resolved_val
             return None
 
+        # Constructor / call sugar: "Client()" → resolve "Client"
+        probe = bound_name.strip()
+        if probe.endswith("()"):
+            probe = probe[:-2].strip()
+        if "[" in probe:
+            probe = probe.split("[", 1)[0].strip()
+
+        # If the binding already names a class-like node by id or label, use it
+        if probe in self.resolver.node_ids:
+            return probe
+        label_hits = self.resolver.global_symbol_map.get(probe, [])
+        class_hits = [
+            hid
+            for hid in label_hits
+            if self.resolver.G.nodes[hid].get("type")
+            in ("class", "struct", "interface", "enum")
+        ]
+        if len(class_hits) == 1:
+            return class_hits[0]
+
         resolved_symbol_id = self.resolver.resolve_symbol(nid, bound_name)
+        if not resolved_symbol_id:
+            resolved_symbol_id = self.resolver.resolve_symbol(nid, probe)
         if not resolved_symbol_id or resolved_symbol_id not in self.resolver.node_ids:
             return None
 
@@ -133,6 +158,13 @@ class WorklistFixpointSolver:
                     resolved_type_id = self.resolver.scopes[
                         func_source
                     ].declared_symbols.get(ret_type)
+                    if resolved_type_id:
+                        return resolved_type_id
+                    # Also try short name after generics / path
+                    short = ret_type.rsplit(".", 1)[-1].split("[", 1)[0]
+                    resolved_type_id = self.resolver.scopes[
+                        func_source
+                    ].declared_symbols.get(short)
                     if resolved_type_id:
                         return resolved_type_id
                 resolved_type_id = self.resolver.resolve_symbol(
@@ -348,7 +380,29 @@ class TypeResolver:
         solver = WorklistFixpointSolver(self)
         solver.solve()
 
-    def resolve_all_edges(self) -> None:
+    def resolve_all_edges(self):
+        from codegraph_gen.analyzer import ResolutionStats
+        from codegraph_gen.resolution_classify import (
+            classify_edge_attempt,
+            empty_category_stats,
+        )
+
+        stats = ResolutionStats(by_category=empty_category_stats())
+        max_samples = 40
+        samples_per_category: dict[str, int] = {}
+
+        def _bump(relation: str, key: str) -> None:
+            bucket = stats.by_relation.setdefault(
+                relation, {"attempted": 0, "resolved": 0, "unresolved": 0}
+            )
+            bucket[key] = bucket.get(key, 0) + 1
+
+        def _bump_category(category: str, key: str) -> None:
+            bucket = stats.by_category.setdefault(
+                category, {"attempted": 0, "resolved": 0, "unresolved": 0}
+            )
+            bucket[key] = bucket.get(key, 0) + 1
+
         for ext in self.extractions:
             for edge in ext.edges:
                 src = edge.source
@@ -360,20 +414,83 @@ class TypeResolver:
                 if src not in self.node_ids:
                     continue
 
+                # contains targets are usually already absolute IDs; still track quality
                 resolved_tgt = None
+                strategy = None
+                src_file = self.G.nodes[src].get("source_file", src)
 
                 if rel == "contains":
                     if tgt in self.node_ids:
                         resolved_tgt = tgt
                 elif rel == "imports":
-                    resolved_tgt = self.resolve_import_to_file_node(
-                        self.G.nodes[src]["source_file"], tgt
+                    strategy = self.file_strategies.get(
+                        src_file, get_strategy_for_file(src_file)
                     )
+                    resolved_tgt = self.resolve_import_to_file_node(src_file, tgt)
                 elif rel in ("inherits", "implements", "calls"):
+                    strategy = self.file_strategies.get(
+                        src_file, get_strategy_for_file(src_file)
+                    )
                     resolved_tgt = self.resolve_symbol(src, tgt)
+                else:
+                    # Unknown relation — skip stats
+                    continue
 
-                if resolved_tgt and resolved_tgt in self.node_ids:
+                ok = bool(resolved_tgt and resolved_tgt in self.node_ids)
+                category = classify_edge_attempt(
+                    relation=rel,
+                    target=tgt,
+                    resolved=ok,
+                    global_symbol_map=self.global_symbol_map,
+                    strategy=strategy,
+                )
+
+                stats.attempted += 1
+                _bump(rel, "attempted")
+                _bump_category(category, "attempted")
+
+                if ok:
+                    stats.resolved += 1
+                    _bump(rel, "resolved")
+                    _bump_category(category, "resolved")
                     if rel == "imports":
-                        self.G.add_edge(src, resolved_tgt, relation=rel, raw_target=tgt)
+                        self.G.add_edge(
+                            src, resolved_tgt, relation=rel, raw_target=tgt
+                        )
                     else:
                         self.G.add_edge(src, resolved_tgt, relation=rel)
+                else:
+                    stats.unresolved += 1
+                    _bump(rel, "unresolved")
+                    _bump_category(category, "unresolved")
+                    cat_count = samples_per_category.get(category, 0)
+                    if (
+                        len(stats.unresolved_samples) < max_samples
+                        and cat_count < 12
+                    ):
+                        stats.unresolved_samples.append(
+                            {
+                                "source": src,
+                                "target": tgt,
+                                "relation": rel,
+                                "category": category,
+                            }
+                        )
+                        samples_per_category[category] = cat_count + 1
+
+        self.G.graph["resolution_stats"] = stats
+        logger.info(
+            "Edge resolution: %s/%s resolved (%.1f%%); "
+            "internal %s/%s (%.1f%%), external_unres=%s, builtin_unres=%s, "
+            "attribute_unres=%s",
+            stats.resolved,
+            stats.attempted,
+            100.0 * stats.resolve_rate,
+            stats.internal_resolved,
+            stats.internal_attempted,
+            100.0 * stats.internal_resolve_rate,
+            stats.category_unresolved("external"),
+            stats.category_unresolved("builtin"),
+            stats.category_unresolved("attribute"),
+        )
+        return stats

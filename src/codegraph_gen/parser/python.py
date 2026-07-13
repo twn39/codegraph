@@ -1,234 +1,161 @@
 import logging
 from pathlib import Path
+
 import tree_sitter
 import tree_sitter_python
+
 from codegraph_gen.parser.base import (
-    BaseParser,
-    ASTVisitor,
     ASTParsingContext,
-    get_node_text,
-    get_line_range,
+    ASTVisitor,
+    BaseParser,
     register_parser,
 )
-from codegraph_gen.schema import (
-    ExtractionResult,
-    NodeSchema,
-    EdgeSchema,
-)
+from codegraph_gen.parser.common import VisitorMixin, extract_type_name
+from codegraph_gen.schema import ExtractionResult, NodeSchema
 
 logger = logging.getLogger(__name__)
 
 
-class PythonVisitor:
+class PythonVisitor(VisitorMixin):
     traverser: ASTVisitor
 
-    def __init__(self, ctx: ASTParsingContext, parser):
-        self.ctx = ctx
-        self.parser = parser
-
-    def get_text(self, node: tree_sitter.Node) -> str:
-        return get_node_text(node, self.ctx.source)
-
-    def get_line_range(self, node: tree_sitter.Node) -> tuple[int, int]:
-        return get_line_range(node)
-
-    def get_current_parent_id(self) -> str:
-        return self.ctx.scope.current_id
-
-    def add_node(self, node: NodeSchema) -> None:
-        self.ctx.add_node(node)
-
-    def add_edge(self, edge: EdgeSchema) -> None:
-        self.ctx.add_edge(edge)
-
-    @property
-    def scope(self):
-        return self.ctx.scope
-
-    @property
-    def source(self):
-        return self.ctx.source
-
-    @property
-    def rel_path(self):
-        return self.ctx.rel_path
-
-    def generic_visit(self, node: tree_sitter.Node) -> None:
-        self.traverser.generic_visit(node)
-
-    def visit(self, node: tree_sitter.Node) -> None:
-        self.traverser.visit(node)
+    def visit_decorated_definition(self, node: tree_sitter.Node) -> None:
+        """Unwrap @decorator stacks onto the underlying class/function definition."""
+        definition = None
+        for child in node.children:
+            if child.type in ("class_definition", "function_definition"):
+                definition = child
+                break
+        if definition is not None:
+            self.visit(definition)
+        else:
+            self.generic_visit(node)
 
     def visit_class_definition(self, node: tree_sitter.Node) -> None:
         name_node = node.child_by_field_name("name")
-        if name_node:
-            class_name = self.get_text(name_node)
-            parent_id = self.get_current_parent_id()
-            class_id = f"{self.rel_path}::{class_name}"
+        if not name_node:
+            self.generic_visit(node)
+            return
 
-            start_line, end_line = self.get_line_range(node)
-            self.add_node(
-                NodeSchema(
-                    id=class_id,
-                    label=class_name,
-                    type="class",
-                    source_file=self.rel_path,
-                    line_start=start_line,
-                    line_end=end_line,
-                    signature=self.parser._get_signature(node, self.source),
-                    docstring=self.parser._get_docstring(node, self.source),
-                )
-            )
+        class_name = self.get_text(name_node)
+        class_id = f"{self.rel_path}::{class_name}"
+        self.emit_symbol(
+            node=node,
+            name=class_name,
+            sym_type="class",
+            symbol_id=class_id,
+            signature=self.parser._get_signature(node, self.source),
+            docstring=self.parser._get_docstring(node, self.source),
+        )
 
-            self.add_edge(
-                EdgeSchema(source=parent_id, target=class_id, relation="contains")
-            )
+        superclasses = node.child_by_field_name("superclasses")
+        if superclasses:
+            for child in superclasses.children:
+                if child.type in ("identifier", "attribute"):
+                    parent_class_name = self.get_text(child)
+                    self.emit_relation(class_id, parent_class_name, "inherits")
 
-            # Check inheritance
-            superclasses = node.child_by_field_name("superclasses")
-            if superclasses:
-                for child in superclasses.children:
-                    if child.type in ("identifier", "attribute"):
-                        parent_class_name = self.get_text(child)
-                        self.add_edge(
-                            EdgeSchema(
-                                source=class_id,
-                                target=parent_class_name,
-                                relation="inherits",
-                            )
-                        )
-
-            with self.scope.push(class_id, "class"):
-                self.generic_visit(node)
-        else:
+        with self.scope.push(class_id, "class"):
             self.generic_visit(node)
 
     def visit_function_definition(self, node: tree_sitter.Node) -> None:
         name_node = node.child_by_field_name("name")
-        if name_node:
-            func_name = self.get_text(name_node)
-            parent_id = self.get_current_parent_id()
-            parent_type = self.scope.current_type
-
-            if parent_type == "class":
-                func_id = f"{parent_id}.{func_name}"
-                sym_type = "method"
-            else:
-                func_id = f"{self.rel_path}::{func_name}"
-                sym_type = "function"
-
-            local_bindings = {}
-
-            def extract_type_from_call_or_type(type_or_call_node):
-                if type_or_call_node.type == "identifier":
-                    return self.get_text(type_or_call_node)
-                elif type_or_call_node.type == "attribute":
-                    attr_node = type_or_call_node.child_by_field_name("attribute")
-                    if attr_node:
-                        return self.get_text(attr_node)
-                elif type_or_call_node.type == "type":
-                    for child in type_or_call_node.children:
-                        res = extract_type_from_call_or_type(child)
-                        if res:
-                            return res
-                elif type_or_call_node.type == "call":
-                    func_node = type_or_call_node.child_by_field_name("function")
-                    if func_node:
-                        return extract_type_from_call_or_type(func_node)
-                for child in type_or_call_node.children:
-                    res = extract_type_from_call_or_type(child)
-                    if res:
-                        return res
-                return None
-
-            def collect_local_bindings(n):
-                if n.type == "typed_parameter":
-                    var_name = None
-                    for child in n.children:
-                        if child.type == "identifier":
-                            var_name = self.get_text(child)
-                            break
-                    type_node = n.child_by_field_name("type")
-                    if var_name and type_node:
-                        t_name = extract_type_from_call_or_type(type_node)
-                        if t_name:
-                            local_bindings[var_name] = t_name
-                elif n.type == "assignment":
-                    left = n.child_by_field_name("left") or (
-                        n.children[0] if n.children else None
-                    )
-                    right = n.child_by_field_name("right") or (
-                        n.children[2] if len(n.children) > 2 else None
-                    )
-                    if (
-                        left
-                        and right
-                        and left.type == "identifier"
-                        and right.type == "call"
-                    ):
-                        t_name = extract_type_from_call_or_type(right)
-                        var_name = self.get_text(left)
-                        if t_name:
-                            local_bindings[var_name] = t_name
-                elif n.type == "as_pattern":
-                    call_node = None
-                    target_node = None
-                    for child in n.children:
-                        if child.type == "call":
-                            call_node = child
-                        elif child.type == "as_pattern_target":
-                            for sub in child.children:
-                                if sub.type == "identifier":
-                                    target_node = sub
-                                    break
-                    if call_node and target_node:
-                        t_name = extract_type_from_call_or_type(call_node)
-                        var_name = self.get_text(target_node)
-                        if t_name:
-                            local_bindings[var_name] = t_name
-
-                for child in n.children:
-                    if child.type != "function_definition":
-                        collect_local_bindings(child)
-
-            collect_local_bindings(node)
-
-            start_line, end_line = self.get_line_range(node)
-            self.add_node(
-                NodeSchema(
-                    id=func_id,
-                    label=func_name,
-                    type=sym_type,
-                    source_file=self.rel_path,
-                    line_start=start_line,
-                    line_end=end_line,
-                    signature=self.parser._get_signature(node, self.source),
-                    docstring=self.parser._get_docstring(node, self.source),
-                    local_bindings=local_bindings,
-                )
-            )
-
-            self.add_edge(
-                EdgeSchema(source=parent_id, target=func_id, relation="contains")
-            )
-
-            with self.scope.push(func_id, sym_type):
-                self.generic_visit(node)
-        else:
+        if not name_node:
             self.generic_visit(node)
+            return
+
+        func_name = self.get_text(name_node)
+        parent_id = self.get_current_parent_id()
+        parent_type = self.scope.current_type
+
+        if parent_type == "class":
+            func_id = f"{parent_id}.{func_name}"
+            sym_type = "method"
+        else:
+            func_id = f"{self.rel_path}::{func_name}"
+            sym_type = "function"
+
+        local_bindings = self._collect_local_bindings(node)
+
+        self.emit_symbol(
+            node=node,
+            name=func_name,
+            sym_type=sym_type,
+            symbol_id=func_id,
+            parent_id=parent_id,
+            signature=self.parser._get_signature(node, self.source),
+            docstring=self.parser._get_docstring(node, self.source),
+            local_bindings=local_bindings,
+        )
+
+        with self.scope.push(func_id, sym_type):
+            self.generic_visit(node)
+
+    def _collect_local_bindings(self, node: tree_sitter.Node) -> dict[str, str]:
+        local_bindings: dict[str, str] = {}
+
+        def bind(var_name: str | None, type_node) -> None:
+            if not var_name or type_node is None:
+                return
+            t_name = extract_type_name(type_node, self.get_text)
+            if t_name:
+                local_bindings[var_name] = t_name
+
+        def walk(n: tree_sitter.Node) -> None:
+            if n.type in ("typed_parameter", "typed_default_parameter"):
+                var_name = None
+                for child in n.children:
+                    if child.type == "identifier":
+                        var_name = self.get_text(child)
+                        break
+                type_node = n.child_by_field_name("type")
+                bind(var_name, type_node)
+            elif n.type == "assignment":
+                left = n.child_by_field_name("left") or (
+                    n.children[0] if n.children else None
+                )
+                type_ann = n.child_by_field_name("type")
+                right = n.child_by_field_name("right") or (
+                    n.children[-1] if len(n.children) > 1 else None
+                )
+                if left and left.type == "identifier":
+                    var_name = self.get_text(left)
+                    if type_ann is not None:
+                        bind(var_name, type_ann)
+                    elif right is not None and right.type == "call":
+                        bind(var_name, right)
+            elif n.type == "as_pattern":
+                call_node = None
+                target_node = None
+                for child in n.children:
+                    if child.type == "call":
+                        call_node = child
+                    elif child.type == "as_pattern_target":
+                        for sub in child.children:
+                            if sub.type == "identifier":
+                                target_node = sub
+                                break
+                if call_node and target_node:
+                    bind(self.get_text(target_node), call_node)
+
+            for child in n.children:
+                # Do not descend into nested function bodies for outer bindings
+                if child.type not in ("function_definition", "decorated_definition"):
+                    walk(child)
+
+        walk(node)
+        return local_bindings
 
     def visit_import_statement(self, node: tree_sitter.Node) -> None:
         file_node_id = self.rel_path
         for child in node.children:
             if child.type == "dotted_name":
                 module_name = self.get_text(child)
-                self.add_edge(
-                    EdgeSchema(
-                        source=file_node_id,
-                        target=module_name,
-                        relation="imports",
-                        import_map={module_name: module_name},
-                    )
+                self.emit_relation(
+                    file_node_id,
+                    module_name,
+                    "imports",
+                    import_map={module_name: module_name},
                 )
             elif child.type == "aliased_import":
                 name_node = child.child_by_field_name("name")
@@ -236,22 +163,18 @@ class PythonVisitor:
                 if name_node and alias_node:
                     module_name = self.get_text(name_node)
                     alias_name = self.get_text(alias_node)
-                    self.add_edge(
-                        EdgeSchema(
-                            source=file_node_id,
-                            target=module_name,
-                            relation="imports",
-                            import_map={alias_name: module_name},
-                        )
+                    self.emit_relation(
+                        file_node_id,
+                        module_name,
+                        "imports",
+                        import_map={alias_name: module_name},
                     )
         self.generic_visit(node)
 
     def visit_import_from_statement(self, node: tree_sitter.Node) -> None:
         file_node_id = self.rel_path
         module_node = node.child_by_field_name("module_name")
-        module_name = ""
-        if module_node:
-            module_name = self.get_text(module_node)
+        module_name = self.get_text(module_node) if module_node else ""
 
         dots = ""
         for child in node.children:
@@ -260,7 +183,7 @@ class PythonVisitor:
                 break
 
         target_module = dots + module_name
-        import_map = {}
+        import_map: dict[str, str] = {}
         import_items = []
 
         start_collecting = False
@@ -273,11 +196,7 @@ class PythonVisitor:
             if start_collecting:
                 if child.type == "wildcard_import":
                     import_items.append(child)
-                elif child.type in (
-                    "dotted_name",
-                    "aliased_import",
-                    "identifier",
-                ):
+                elif child.type in ("dotted_name", "aliased_import", "identifier"):
                     import_items.append(child)
                 elif child.type == "import_list":
                     for sub_child in child.children:
@@ -303,13 +222,11 @@ class PythonVisitor:
                     import_map[alias] = name
 
         if target_module:
-            self.add_edge(
-                EdgeSchema(
-                    source=file_node_id,
-                    target=target_module,
-                    relation="imports",
-                    import_map=import_map,
-                )
+            self.emit_relation(
+                file_node_id,
+                target_module,
+                "imports",
+                import_map=import_map,
             )
         self.generic_visit(node)
 
@@ -318,9 +235,7 @@ class PythonVisitor:
         if func_node:
             callee_name = self.get_text(func_node)
             caller_id = self.get_current_parent_id()
-            self.add_edge(
-                EdgeSchema(source=caller_id, target=callee_name, relation="calls")
-            )
+            self.emit_relation(caller_id, callee_name, "calls")
         self.generic_visit(node)
 
 
@@ -375,7 +290,6 @@ class PythonParser(BaseParser):
         rel_path = str(file_path.relative_to(workspace_dir))
         result = ExtractionResult()
 
-        # Add file node representing the module itself
         file_node_id = rel_path
         result.nodes.append(
             NodeSchema(

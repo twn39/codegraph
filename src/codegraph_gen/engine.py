@@ -1,25 +1,35 @@
-import logging
-import json
-import hashlib
 import concurrent.futures
+import hashlib
+import json
+import logging
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
 import networkx as nx
 from pydantic import BaseModel, ConfigDict
 
-from codegraph_gen.config import CodegraphConfig, CacheEntry
-from codegraph_gen.schema import ExtractionResult
-from codegraph_gen.detect import discover_files
-from codegraph_gen.parser import get_parser
+from codegraph_gen.analyzer import AnalysisResult, ResolutionStats, analyze_graph
 from codegraph_gen.builder import build_graph
 from codegraph_gen.cluster import detect_components
-from codegraph_gen.analyzer import analyze_graph, AnalysisResult
+from codegraph_gen.config import CacheEntry, CodegraphConfig
+from codegraph_gen.detect import discover_files
+from codegraph_gen.incremental import (
+    SIGNATURE_STORE_NAME,
+    component_signature,
+    import_dependents,
+    load_signature_store,
+    node_neighborhood_signature,
+    save_signature_store,
+    should_force_render_node,
+)
+from codegraph_gen.parser import get_parser
 from codegraph_gen.renderer import (
     MarkdownRenderer,
-    get_node_filename,
     get_component_filename,
+    get_node_filename,
 )
+from codegraph_gen.schema import ExtractionResult
 from codegraph_gen.writer import VaultWriter
 
 logger = logging.getLogger(__name__)
@@ -42,9 +52,9 @@ def _parse_file_worker(
 ) -> tuple[Path, Optional[ExtractionResult], Optional[str]]:
     """Worker function for parallel file parsing."""
     try:
-        from codegraph_gen.parser import get_parser
+        from codegraph_gen.parser import get_parser as _get_parser
 
-        parser = get_parser(lang)
+        parser = _get_parser(lang)
         result = parser.parse_file(file_path, workspace_dir)
         return file_path, result, None
     except Exception as e:
@@ -65,6 +75,9 @@ class PipelineStage(str, Enum):
     COMPLETED = "completed"
 
 
+ProgressCallback = Callable[[PipelineStage, Any, int, int], None]
+
+
 class PipelineResult(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -83,20 +96,12 @@ class CodegraphEngine:
     def run_pipeline(
         self,
         config: CodegraphConfig,
-        progress_callback: Optional[
-            Callable[[PipelineStage, Any, int, int], None]
-        ] = None,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> PipelineResult:
-        """
-        Runs the full codegraph generation pipeline.
-        Args:
-            config: Configuration settings.
-            progress_callback: A function taking (stage, current_item, index, total)
-        """
+        """Run the full codegraph generation pipeline as an ordered stage list."""
         logger.info("Starting codegraph engine pipeline...")
         renderer = MarkdownRenderer(config.workspace_dir)
 
-        # 1. Discover files
         if progress_callback:
             progress_callback(PipelineStage.DISCOVERING, None, 0, 0)
         files = discover_files(
@@ -118,209 +123,42 @@ class CodegraphEngine:
                 analysis=AnalysisResult(god_nodes=[], cycles=[], inter_comp_deps={}),
             )
 
-        # 2. Parse files (with caching and optional parallel processing)
-        extractions = []
-        total_files = len(files)
-
         cache_path = config.absolute_output_dir / "cache.json"
-        cache_entries = {}
-        if config.use_cache and cache_path.exists():
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    cache_data = json.load(f)
-                    for k, v in cache_data.items():
-                        cache_entries[k] = CacheEntry(**v)
-                logger.info(f"Loaded {len(cache_entries)} cache entries.")
-            except Exception as e:
-                logger.warning(f"Could not load cache: {e}")
+        extractions, dirty_files, new_cache_entries = self._parse_with_cache(
+            config, files, cache_path, progress_callback
+        )
 
-        files_to_parse = []
-        new_cache_entries = {}
-
-        for file_path, lang in files:
-            rel_path = str(file_path.relative_to(config.workspace_dir))
-            try:
-                stat = file_path.stat()
-                mtime = stat.st_mtime
-                size = stat.st_size
-                file_hash = get_file_hash(file_path)
-
-                # Check cache hit
-                if rel_path in cache_entries:
-                    entry = cache_entries[rel_path]
-                    if (
-                        entry.mtime == mtime
-                        and entry.size == size
-                        and entry.hash == file_hash
-                    ):
-                        extractions.append(entry.result)
-                        new_cache_entries[rel_path] = entry
-                        continue
-
-                # Cache miss
-                files_to_parse.append(
-                    (file_path, lang, rel_path, mtime, size, file_hash)
-                )
-            except Exception as e:
-                logger.error(f"Error accessing file metadata for {file_path}: {e}")
-                # Fallback to parsing without cache metadata
-                files_to_parse.append((file_path, lang, rel_path, 0.0, 0, ""))
-
-        num_hits = total_files - len(files_to_parse)
-        if num_hits > 0:
-            logger.info(
-                f"Cache hit: {num_hits} / {total_files} files loaded from cache."
-            )
-
-        if not files_to_parse:
-            if progress_callback:
-                progress_callback(PipelineStage.PARSING, None, total_files, total_files)
-        else:
-            max_workers = config.max_workers
-            if max_workers > 1 and len(files_to_parse) > 1:
-                logger.info(
-                    f"Parsing {len(files_to_parse)} files in parallel with {max_workers} workers..."
-                )
-                with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=max_workers
-                ) as executor:
-                    futures = {
-                        executor.submit(
-                            _parse_file_worker,
-                            file_path,
-                            lang,
-                            config.workspace_dir,
-                        ): (file_path, rel_path, mtime, size, file_hash)
-                        for file_path, lang, rel_path, mtime, size, file_hash in files_to_parse
-                    }
-
-                    for idx, future in enumerate(
-                        concurrent.futures.as_completed(futures), start=1
-                    ):
-                        file_path, rel_path, mtime, size, file_hash = futures[future]
-                        progress_idx = num_hits + idx
-                        if progress_callback:
-                            progress_callback(
-                                PipelineStage.PARSING,
-                                file_path,
-                                progress_idx,
-                                total_files,
-                            )
-
-                        try:
-                            _, result, err_msg = future.result()
-                            if err_msg:
-                                logger.error(
-                                    f"Error parsing file {file_path} in worker: {err_msg}"
-                                )
-                            elif result:
-                                extractions.append(result)
-                                if file_hash:
-                                    new_cache_entries[rel_path] = CacheEntry(
-                                        mtime=mtime,
-                                        size=size,
-                                        hash=file_hash,
-                                        result=result,
-                                    )
-                        except Exception as e:
-                            logger.error(f"Failed to parse file {file_path}: {e}")
-            else:
-                logger.info(f"Parsing {len(files_to_parse)} files sequentially...")
-                for idx, (
-                    file_path,
-                    lang,
-                    rel_path,
-                    mtime,
-                    size,
-                    file_hash,
-                ) in enumerate(files_to_parse, start=1):
-                    progress_idx = num_hits + idx
-                    if progress_callback:
-                        progress_callback(
-                            PipelineStage.PARSING, file_path, progress_idx, total_files
-                        )
-                    try:
-                        parser = get_parser(lang)
-                        result = parser.parse_file(file_path, config.workspace_dir)
-                        extractions.append(result)
-                        if file_hash:
-                            new_cache_entries[rel_path] = CacheEntry(
-                                mtime=mtime, size=size, hash=file_hash, result=result
-                            )
-                    except Exception as e:
-                        logger.error(f"Error parsing file {file_path}: {e}")
-
-        # 3. Build graph
         if progress_callback:
             progress_callback(PipelineStage.BUILDING, None, 0, 0)
         G = build_graph(extractions, config.workspace_dir)
 
-        # 4. Component clustering
         if progress_callback:
             progress_callback(PipelineStage.CLUSTERING, None, 0, 0)
-        components, cohesion_scores, component_names = detect_components(G)
+        components, cohesion_scores, component_names = detect_components(
+            G,
+            exclude_tests_from_clustering=config.exclude_tests_from_clustering,
+            naming_mode=config.component_naming,
+        )
 
-        # 5. Graph analysis
         if progress_callback:
             progress_callback(PipelineStage.ANALYZING, None, 0, 0)
         analysis = analyze_graph(G, components)
+        self._enforce_quality_gates(config, analysis.resolution)
 
-        # 6. Render pages in memory
         if progress_callback:
             progress_callback(PipelineStage.RENDERING, None, 0, 0)
-        node_component_map = {}
-        for cid, members in components.items():
-            comp_name = component_names.get(cid, f"Component {cid}")
-            for member in members:
-                node_component_map[member] = comp_name
+        rendered_nodes, rendered_components, new_sigs = self._render_incremental(
+            config,
+            renderer,
+            G,
+            components,
+            cohesion_scores,
+            component_names,
+            analysis,
+            dirty_files,
+        )
 
-        rendered_nodes = {}
-        for nid, ndata in G.nodes(data=True):
-            fname = get_node_filename(nid)
-            content = renderer.render_node_page(nid, ndata, G, node_component_map)
-            rendered_nodes[fname] = content
-
-        rendered_components = {}
-        for cid, members in components.items():
-            comp_name = component_names[cid]
-            cohesion = cohesion_scores[cid]
-            fname = get_component_filename(comp_name)
-            content = renderer.render_component_page(
-                cid,
-                members,
-                G,
-                cohesion,
-                comp_name,
-                analysis.inter_comp_deps,
-                component_names,
-            )
-            rendered_components[fname] = content
-
-        # Check if README already has AI Insights and preserve it
-        ai_insights = None
-        readme_path = config.absolute_output_dir / "README.md"
-        if readme_path.exists():
-            try:
-                old_readme = readme_path.read_text(encoding="utf-8")
-                marker = None
-                for m in (
-                    "## AI Architectural Insights",
-                    "## AI 架构深度洞察 (AI Architectural Insights)",
-                    "## AI 架构深度洞察",
-                ):
-                    if m in old_readme:
-                        marker = m
-                        break
-                if marker:
-                    parts = old_readme.split(marker, 1)
-                    insights_text = parts[1].strip()
-                    if insights_text:
-                        ai_insights = insights_text
-            except Exception as e:
-                logger.warning(
-                    f"Could not read existing README.md to preserve AI insights: {e}"
-                )
-
+        ai_insights = self._load_preserved_ai_insights(config.absolute_output_dir)
         readme_content = renderer.render_readme(
             G,
             components,
@@ -329,35 +167,31 @@ class CodegraphEngine:
             analysis,
             ai_insights=ai_insights,
         )
-
         prompt_content = renderer.render_agent_prompt(
             G, components, cohesion_scores, component_names, analysis
         )
 
-        # 7. Write vault to disk
         if progress_callback:
             progress_callback(PipelineStage.WRITING, None, 0, 0)
-        self.writer.write_vault(
+        write_stats = self.writer.write_vault(
             config.absolute_output_dir,
             rendered_nodes,
             rendered_components,
             readme_content,
             prompt_content,
         )
+        G.graph["vault_write_stats"] = {
+            "written": write_stats.written,
+            "skipped": write_stats.skipped,
+            "removed": write_stats.removed,
+        }
 
-        # Write updated cache back to disk
-        if config.use_cache:
-            try:
-                config.absolute_output_dir.mkdir(parents=True, exist_ok=True)
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {k: v.model_dump() for k, v in new_cache_entries.items()},
-                        f,
-                        indent=2,
-                    )
-                logger.info(f"Saved {len(new_cache_entries)} cache entries.")
-            except Exception as e:
-                logger.warning(f"Could not save cache: {e}")
+        self._export_json_if_enabled(
+            config, G, components, cohesion_scores, component_names, analysis
+        )
+        self._save_cache_and_signatures(
+            config, cache_path, new_cache_entries, new_sigs
+        )
 
         if progress_callback:
             progress_callback(PipelineStage.COMPLETED, None, 0, 0)
@@ -371,3 +205,399 @@ class CodegraphEngine:
             component_names=component_names,
             analysis=analysis,
         )
+
+    # ── Stage helpers ──────────────────────────────────────────────────────
+
+    def _load_cache_entries(self, cache_path: Path) -> dict[str, CacheEntry]:
+        cache_entries: dict[str, CacheEntry] = {}
+        if not cache_path.exists():
+            return cache_entries
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+                for k, v in cache_data.items():
+                    cache_entries[k] = CacheEntry(**v)
+            logger.info(f"Loaded {len(cache_entries)} cache entries.")
+        except Exception as e:
+            logger.warning(f"Could not load cache: {e}")
+        return cache_entries
+
+    def _parse_with_cache(
+        self,
+        config: CodegraphConfig,
+        files: list[tuple[Path, str]],
+        cache_path: Path,
+        progress_callback: Optional[ProgressCallback],
+    ) -> tuple[list[ExtractionResult], set[str], dict[str, CacheEntry]]:
+        """Parse files with optional disk cache; return extractions, dirty set, cache map."""
+        total_files = len(files)
+        cache_entries = (
+            self._load_cache_entries(cache_path) if config.use_cache else {}
+        )
+        extractions: list[ExtractionResult] = []
+        files_to_parse: list[tuple[Path, str, str, float, int, str]] = []
+        new_cache_entries: dict[str, CacheEntry] = {}
+        dirty_files: set[str] = set()
+
+        for file_path, lang in files:
+            rel_path = str(file_path.relative_to(config.workspace_dir))
+            try:
+                stat = file_path.stat()
+                mtime = stat.st_mtime
+                size = stat.st_size
+                file_hash = get_file_hash(file_path)
+
+                if rel_path in cache_entries:
+                    entry = cache_entries[rel_path]
+                    if (
+                        entry.mtime == mtime
+                        and entry.size == size
+                        and entry.hash == file_hash
+                    ):
+                        extractions.append(entry.result)
+                        new_cache_entries[rel_path] = entry
+                        continue
+
+                dirty_files.add(rel_path)
+                files_to_parse.append(
+                    (file_path, lang, rel_path, mtime, size, file_hash)
+                )
+            except Exception as e:
+                logger.error(f"Error accessing file metadata for {file_path}: {e}")
+                dirty_files.add(rel_path)
+                files_to_parse.append((file_path, lang, rel_path, 0.0, 0, ""))
+
+        removed_files = set(cache_entries.keys()) - {
+            str(fp.relative_to(config.workspace_dir)) for fp, _ in files
+        }
+        dirty_files |= removed_files
+
+        num_hits = total_files - len(files_to_parse)
+        if num_hits > 0:
+            logger.info(
+                f"Cache hit: {num_hits} / {total_files} files loaded from cache."
+            )
+        if dirty_files:
+            logger.info(
+                "Dirty / re-parsed files: %s (removed=%s)",
+                len(dirty_files),
+                len(removed_files),
+            )
+
+        if not files_to_parse:
+            if progress_callback:
+                progress_callback(
+                    PipelineStage.PARSING, None, total_files, total_files
+                )
+            return extractions, dirty_files, new_cache_entries
+
+        max_workers = config.max_workers
+        if max_workers > 1 and len(files_to_parse) > 1:
+            logger.info(
+                f"Parsing {len(files_to_parse)} files in parallel with "
+                f"{max_workers} workers..."
+            )
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_workers
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _parse_file_worker,
+                        file_path,
+                        lang,
+                        config.workspace_dir,
+                    ): (file_path, rel_path, mtime, size, file_hash)
+                    for file_path, lang, rel_path, mtime, size, file_hash in files_to_parse
+                }
+
+                for idx, future in enumerate(
+                    concurrent.futures.as_completed(futures), start=1
+                ):
+                    file_path, rel_path, mtime, size, file_hash = futures[future]
+                    progress_idx = num_hits + idx
+                    if progress_callback:
+                        progress_callback(
+                            PipelineStage.PARSING,
+                            file_path,
+                            progress_idx,
+                            total_files,
+                        )
+                    try:
+                        _, result, err_msg = future.result()
+                        if err_msg:
+                            logger.error(
+                                f"Error parsing file {file_path} in worker: {err_msg}"
+                            )
+                        elif result:
+                            extractions.append(result)
+                            if file_hash:
+                                new_cache_entries[rel_path] = CacheEntry(
+                                    mtime=mtime,
+                                    size=size,
+                                    hash=file_hash,
+                                    result=result,
+                                )
+                    except Exception as e:
+                        logger.error(f"Failed to parse file {file_path}: {e}")
+        else:
+            logger.info(f"Parsing {len(files_to_parse)} files sequentially...")
+            for idx, (
+                file_path,
+                lang,
+                rel_path,
+                mtime,
+                size,
+                file_hash,
+            ) in enumerate(files_to_parse, start=1):
+                progress_idx = num_hits + idx
+                if progress_callback:
+                    progress_callback(
+                        PipelineStage.PARSING, file_path, progress_idx, total_files
+                    )
+                try:
+                    parser = get_parser(lang)
+                    result = parser.parse_file(file_path, config.workspace_dir)
+                    extractions.append(result)
+                    if file_hash:
+                        new_cache_entries[rel_path] = CacheEntry(
+                            mtime=mtime, size=size, hash=file_hash, result=result
+                        )
+                except Exception as e:
+                    logger.error(f"Error parsing file {file_path}: {e}")
+
+        return extractions, dirty_files, new_cache_entries
+
+    @staticmethod
+    def _enforce_quality_gates(
+        config: CodegraphConfig,
+        resolution: ResolutionStats | None,
+    ) -> None:
+        """Raise RuntimeError when configured resolution CI gates fail."""
+        if resolution is None:
+            return
+        res = resolution
+
+        if config.min_resolve_rate is not None:
+            if res.resolve_rate < config.min_resolve_rate:
+                raise RuntimeError(
+                    f"Edge resolve rate {res.resolve_rate:.1%} is below "
+                    f"min_resolve_rate={config.min_resolve_rate:.1%} "
+                    f"({res.resolved}/{res.attempted} resolved, "
+                    f"{res.unresolved} unresolved)"
+                )
+
+        if config.max_unresolved_edges is not None:
+            if res.unresolved > config.max_unresolved_edges:
+                raise RuntimeError(
+                    f"Unresolved edges {res.unresolved} exceed "
+                    f"max_unresolved_edges={config.max_unresolved_edges} "
+                    f"(resolve rate {res.resolve_rate:.1%})"
+                )
+
+        if config.min_internal_resolve_rate is not None:
+            if res.internal_resolve_rate < config.min_internal_resolve_rate:
+                raise RuntimeError(
+                    f"Internal edge resolve rate {res.internal_resolve_rate:.1%} "
+                    f"is below min_internal_resolve_rate="
+                    f"{config.min_internal_resolve_rate:.1%} "
+                    f"({res.internal_resolved}/{res.internal_attempted} internal, "
+                    f"{res.internal_unresolved} internal unresolved)"
+                )
+
+        if config.max_internal_unresolved_edges is not None:
+            if res.internal_unresolved > config.max_internal_unresolved_edges:
+                raise RuntimeError(
+                    f"Internal unresolved edges {res.internal_unresolved} exceed "
+                    f"max_internal_unresolved_edges="
+                    f"{config.max_internal_unresolved_edges} "
+                    f"(internal resolve rate {res.internal_resolve_rate:.1%})"
+                )
+
+    def _render_incremental(
+        self,
+        config: CodegraphConfig,
+        renderer: MarkdownRenderer,
+        G: nx.DiGraph,
+        components: dict[int, list[str]],
+        cohesion_scores: dict[int, float],
+        component_names: dict[int, str],
+        analysis: AnalysisResult,
+        dirty_files: set[str],
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+        """Render node/component pages with signature-based skip when cache on."""
+        node_component_map: dict[str, str] = {}
+        for cid, members in components.items():
+            comp_name = component_names.get(cid, f"Component {cid}")
+            for member in members:
+                node_component_map[member] = comp_name
+
+        force_files = (
+            import_dependents(G, dirty_files)
+            if (config.use_cache and dirty_files)
+            else set()
+        )
+        sig_path = config.absolute_output_dir / SIGNATURE_STORE_NAME
+        prev_sigs = load_signature_store(sig_path) if config.use_cache else {}
+        new_sigs: dict[str, str] = {}
+        nodes_dir = config.absolute_output_dir / "nodes"
+        comps_dir = config.absolute_output_dir / "components"
+
+        rendered_nodes: dict[str, str] = {}
+        nodes_reused = 0
+        nodes_rendered = 0
+        for nid, ndata in G.nodes(data=True):
+            fname = get_node_filename(nid)
+            comp_name = node_component_map.get(nid, "None")
+            sig = node_neighborhood_signature(G, nid, comp_name)
+            new_sigs[f"node:{nid}"] = sig
+            disk_path = nodes_dir / fname
+            can_reuse = (
+                config.use_cache
+                and prev_sigs.get(f"node:{nid}") == sig
+                and disk_path.is_file()
+                and not should_force_render_node(G, nid, force_files)
+            )
+            if can_reuse:
+                try:
+                    rendered_nodes[fname] = disk_path.read_text(encoding="utf-8")
+                    nodes_reused += 1
+                    continue
+                except Exception:
+                    pass
+            content = renderer.render_node_page(nid, ndata, G, node_component_map)
+            rendered_nodes[fname] = content
+            nodes_rendered += 1
+
+        rendered_components: dict[str, str] = {}
+        comps_reused = 0
+        comps_rendered = 0
+        for cid, members in components.items():
+            comp_name = component_names[cid]
+            cohesion = cohesion_scores[cid]
+            fname = get_component_filename(comp_name)
+            inter = analysis.inter_comp_deps.get(cid, {})
+            sig = component_signature(members, cohesion, comp_name, inter)
+            new_sigs[f"comp:{comp_name}"] = sig
+            disk_path = comps_dir / fname
+            member_forced = any(
+                should_force_render_node(G, m, force_files) for m in members
+            )
+            can_reuse = (
+                config.use_cache
+                and prev_sigs.get(f"comp:{comp_name}") == sig
+                and disk_path.is_file()
+                and not member_forced
+            )
+            if can_reuse:
+                try:
+                    rendered_components[fname] = disk_path.read_text(encoding="utf-8")
+                    comps_reused += 1
+                    continue
+                except Exception:
+                    pass
+            content = renderer.render_component_page(
+                cid,
+                members,
+                G,
+                cohesion,
+                comp_name,
+                analysis.inter_comp_deps,
+                component_names,
+            )
+            rendered_components[fname] = content
+            comps_rendered += 1
+
+        logger.info(
+            "Incremental render: nodes %s rendered / %s reused; components %s / %s",
+            nodes_rendered,
+            nodes_reused,
+            comps_rendered,
+            comps_reused,
+        )
+        G.graph["render_stats"] = {
+            "nodes_rendered": nodes_rendered,
+            "nodes_reused": nodes_reused,
+            "components_rendered": comps_rendered,
+            "components_reused": comps_reused,
+            "dirty_files": len(dirty_files),
+            "force_files": len(force_files),
+        }
+        # Stash sig path key for save step
+        G.graph["_signature_store_path"] = str(sig_path)
+        return rendered_nodes, rendered_components, new_sigs
+
+    @staticmethod
+    def _load_preserved_ai_insights(output_dir: Path) -> str | None:
+        readme_path = output_dir / "README.md"
+        if not readme_path.exists():
+            return None
+        try:
+            old_readme = readme_path.read_text(encoding="utf-8")
+            marker = None
+            for m in (
+                "## AI Architectural Insights",
+                "## AI 架构深度洞察 (AI Architectural Insights)",
+                "## AI 架构深度洞察",
+            ):
+                if m in old_readme:
+                    marker = m
+                    break
+            if marker:
+                parts = old_readme.split(marker, 1)
+                insights_text = parts[1].strip()
+                if insights_text:
+                    return insights_text
+        except Exception as e:
+            logger.warning(
+                f"Could not read existing README.md to preserve AI insights: {e}"
+            )
+        return None
+
+    @staticmethod
+    def _export_json_if_enabled(
+        config: CodegraphConfig,
+        G: nx.DiGraph,
+        components: dict[int, list[str]],
+        cohesion_scores: dict[int, float],
+        component_names: dict[int, str],
+        analysis: AnalysisResult,
+    ) -> None:
+        if not getattr(config, "export_json", True):
+            return
+        try:
+            from codegraph_gen.export_json import graph_to_export_dict, write_graph_json
+
+            payload = graph_to_export_dict(
+                G,
+                components,
+                cohesion_scores,
+                component_names,
+                analysis,
+            )
+            write_graph_json(config.absolute_output_dir / "graph.json", payload)
+            logger.info("Wrote graph.json export.")
+        except Exception as e:
+            logger.warning(f"Could not write graph.json: {e}")
+
+    @staticmethod
+    def _save_cache_and_signatures(
+        config: CodegraphConfig,
+        cache_path: Path,
+        new_cache_entries: dict[str, CacheEntry],
+        new_sigs: dict[str, str],
+    ) -> None:
+        if not config.use_cache:
+            return
+        try:
+            config.absolute_output_dir.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {k: v.model_dump() for k, v in new_cache_entries.items()},
+                    f,
+                    indent=2,
+                )
+            logger.info(f"Saved {len(new_cache_entries)} cache entries.")
+            sig_path = config.absolute_output_dir / SIGNATURE_STORE_NAME
+            save_signature_store(sig_path, new_sigs)
+        except Exception as e:
+            logger.warning(f"Could not save cache: {e}")

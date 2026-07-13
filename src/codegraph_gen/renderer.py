@@ -20,6 +20,28 @@ class MarkdownRenderer:
     def __init__(self, workspace_dir: Path):
         self.workspace_dir = workspace_dir
 
+    def _format_resolution_prompt_block(self, analysis: AnalysisResult) -> str:
+        if analysis.resolution is None:
+            return ""
+        res = analysis.resolution
+        lines = [
+            f"- Edge resolution: {res.resolved}/{res.attempted} "
+            f"({100.0 * res.resolve_rate:.1f}%)",
+            f"- Unresolved edges: {res.unresolved}",
+            f"- Internal resolution: {res.internal_resolved}/{res.internal_attempted} "
+            f"({100.0 * res.internal_resolve_rate:.1f}%), "
+            f"internal_unresolved={res.internal_unresolved}",
+            f"- Unresolved by category: external={res.category_unresolved('external')}, "
+            f"builtin={res.category_unresolved('builtin')}, "
+            f"attribute={res.category_unresolved('attribute')}, "
+            f"internal={res.category_unresolved('internal')}",
+        ]
+        if analysis.call_cycles:
+            lines.append(
+                f"- Multi-node call-cycle samples: {len(analysis.call_cycles)}"
+            )
+        return "\n".join(lines)
+
     def generate_architecture_description(self, G: nx.DiGraph) -> str:
         """Dynamically generates an overall architecture description in Chinese."""
         file_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "file"]
@@ -320,6 +342,30 @@ class MarkdownRenderer:
             f"- **Files Scanned:** {files_count}",
             f"- **Symbols Extracted:** {symbols_count}",
             f"- **Call/Relation Edges:** {G.number_of_edges()}",
+        ]
+
+        if analysis.resolution is not None:
+            res = analysis.resolution
+            rate_pct = 100.0 * res.resolve_rate
+            int_pct = 100.0 * res.internal_resolve_rate
+            readme_lines += [
+                f"- **Edge Resolution:** {res.resolved}/{res.attempted} resolved ({rate_pct:.1f}%)",
+                f"- **Unresolved Edges:** {res.unresolved}",
+                f"- **Internal Resolution:** {res.internal_resolved}/{res.internal_attempted} "
+                f"({int_pct:.1f}%), internal unresolved={res.internal_unresolved}",
+                f"- **Unresolved by Category:** external={res.category_unresolved('external')}, "
+                f"builtin={res.category_unresolved('builtin')}, "
+                f"attribute={res.category_unresolved('attribute')}, "
+                f"internal={res.category_unresolved('internal')}",
+            ]
+
+        if analysis.metrics.get("relation_counts"):
+            rel_parts = ", ".join(
+                f"{k}={v}" for k, v in sorted(analysis.metrics["relation_counts"].items())
+            )
+            readme_lines.append(f"- **Relation Mix:** {rel_parts}")
+
+        readme_lines += [
             "",
             arch_desc,
             "",
@@ -367,10 +413,10 @@ class MarkdownRenderer:
         readme_lines += [
             "",
             "## God Nodes (Top Core Abstractions)",
-            "These symbols have the highest degrees (most connections) in the codebase. Modifying them may have wide-reaching effects:",
+            "These symbols have the highest degrees (most connections) in the codebase. Test paths are excluded. Modifying them may have wide-reaching effects:",
             "",
-            "| Symbol | Type | Connections | File |",
-            "|---|---|---|---|",
+            "| Symbol | Type | Degree | In | Out | File |",
+            "|---|---|---|---|---|---|",
         ]
 
         for node in analysis.god_nodes:
@@ -378,8 +424,24 @@ class MarkdownRenderer:
             ndata = G.nodes[nid]
             sf = ndata.get("source_file", "")
             readme_lines.append(
-                f"| [{node['label']}](nodes/{get_node_filename(nid)}) | `{node['type']}` | {node['degree']} | `{sf}` |"
+                f"| [{node['label']}](nodes/{get_node_filename(nid)}) | `{node['type']}` | {node['degree']} | {node.get('in_degree', '-')} | {node.get('out_degree', '-')} | `{sf}` |"
             )
+
+        if analysis.resolution is not None and analysis.resolution.unresolved_samples:
+            readme_lines += [
+                "",
+                "## Unresolved Edge Samples",
+                "Representative edges that could not be bound to a graph symbol, "
+                "classified as internal / external / builtin / attribute:",
+                "",
+                "| Category | Relation | Source | Target |",
+                "|---|---|---|---|",
+            ]
+            for sample in analysis.resolution.unresolved_samples[:20]:
+                readme_lines.append(
+                    f"| `{sample.get('category', '?')}` | `{sample.get('relation')}` | "
+                    f"`{sample.get('source')}` | `{sample.get('target')}` |"
+                )
 
         readme_lines += [
             "",
@@ -399,6 +461,21 @@ class MarkdownRenderer:
                 readme_lines.append(f"{idx}. {cycle_str}")
         else:
             readme_lines.append("No circular imports detected. Perfect modularity!")
+
+        if analysis.call_cycles:
+            readme_lines += [
+                "",
+                "## Call Cycles (Sample)",
+                "Multi-node mutual call cycles only (self-recursion is filtered):",
+                "Short symbol-level call cycles (capped). These may indicate recursion or mutual coupling:",
+                "",
+            ]
+            for idx, cycle in enumerate(analysis.call_cycles[:10], start=1):
+                labels = []
+                for nid in cycle + [cycle[0]]:
+                    lab = G.nodes[nid].get("label", nid) if nid in G.nodes else nid
+                    labels.append(f"`{lab}`")
+                readme_lines.append(f"{idx}. {' ➡️ '.join(labels)}")
 
         readme_lines.append("")
 
@@ -473,6 +550,7 @@ class MarkdownRenderer:
 - 物理文件数: {files_count}
 - 符号数 (类/结构体/函数/方法): {symbols_count}
 - 依赖与调用边总数: {G.number_of_edges()}
+{self._format_resolution_prompt_block(analysis)}
 
 【逻辑组件划分 (Modularity Components)】
 {comp_str}

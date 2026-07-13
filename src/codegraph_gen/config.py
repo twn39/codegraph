@@ -88,6 +88,24 @@ class ProjectConfig(BaseModel):
     cache: bool = True
     """Enable incremental parse cache."""
 
+    exclude_tests_from_clustering: bool = True
+    """When true, Louvain runs without test-path nodes (tests reattached after)."""
+
+    component_naming: str = "hybrid"
+    """Component name strategy: hybrid | package | symbol."""
+
+    min_resolve_rate: Optional[float] = None
+    """CI gate: fail build if overall edge resolve rate is below this (0.0–1.0)."""
+
+    max_unresolved_edges: Optional[int] = None
+    """CI gate: fail build if overall unresolved edge count exceeds this."""
+
+    min_internal_resolve_rate: Optional[float] = None
+    """CI gate: fail if *internal* edge resolve rate is below this (0.0–1.0)."""
+
+    max_internal_unresolved_edges: Optional[int] = None
+    """CI gate: fail if unresolved *internal* edge count exceeds this."""
+
 
 def load_project_config(workspace_dir: Path) -> Optional[ProjectConfig]:
     """
@@ -124,6 +142,20 @@ class CodegraphConfig(BaseModel):
     use_cache: bool = Field(default=True)
     include_dirs: Optional[list[Path]] = Field(default=None)
     """Absolute paths of subdirectories to scan. None = scan entire workspace_dir."""
+    export_json: bool = Field(default=True)
+    """Write graph.json machine-readable export alongside the Markdown vault."""
+    exclude_tests_from_clustering: bool = Field(default=True)
+    """Exclude test-path nodes from Louvain seed graph."""
+    component_naming: str = Field(default="hybrid")
+    """hybrid | package | symbol component naming strategy."""
+    min_resolve_rate: Optional[float] = Field(default=None)
+    """If set, pipeline raises when overall resolve_rate is below this threshold."""
+    max_unresolved_edges: Optional[int] = Field(default=None)
+    """If set, pipeline raises when overall unresolved edges exceed this count."""
+    min_internal_resolve_rate: Optional[float] = Field(default=None)
+    """If set, pipeline raises when internal_resolve_rate is below this threshold."""
+    max_internal_unresolved_edges: Optional[int] = Field(default=None)
+    """If set, pipeline raises when unresolved internal edges exceed this count."""
 
     @property
     def absolute_output_dir(self) -> Path:

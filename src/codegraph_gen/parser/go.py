@@ -6,59 +6,23 @@ from codegraph_gen.parser.base import (
     BaseParser,
     ASTVisitor,
     ASTParsingContext,
-    get_node_text,
-    get_line_range,
     register_parser,
 )
+from codegraph_gen.parser.common import VisitorMixin
 from codegraph_gen.schema import (
     ExtractionResult,
     NodeSchema,
-    EdgeSchema,
 )
 
 logger = logging.getLogger(__name__)
 
 
-class GoVisitor:
+class GoVisitor(VisitorMixin):
     traverser: ASTVisitor
 
     def __init__(self, ctx: ASTParsingContext, parser):
-        self.ctx = ctx
-        self.parser = parser
+        super().__init__(ctx, parser)
         self.file_node_id = ctx.rel_path
-
-    def get_text(self, node: tree_sitter.Node) -> str:
-        return get_node_text(node, self.ctx.source)
-
-    def get_line_range(self, node: tree_sitter.Node) -> tuple[int, int]:
-        return get_line_range(node)
-
-    def get_current_parent_id(self) -> str:
-        return self.ctx.scope.current_id
-
-    def add_node(self, node: NodeSchema) -> None:
-        self.ctx.add_node(node)
-
-    def add_edge(self, edge: EdgeSchema) -> None:
-        self.ctx.add_edge(edge)
-
-    @property
-    def scope(self):
-        return self.ctx.scope
-
-    @property
-    def source(self):
-        return self.ctx.source
-
-    @property
-    def rel_path(self):
-        return self.ctx.rel_path
-
-    def generic_visit(self, node: tree_sitter.Node) -> None:
-        self.traverser.generic_visit(node)
-
-    def visit(self, node: tree_sitter.Node) -> None:
-        self.traverser.visit(node)
 
     def get_receiver_type(self, method_node) -> str | None:
         receiver = method_node.child_by_field_name("receiver")
@@ -85,26 +49,14 @@ class GoVisitor:
                             sym_type = "interface"
                             break
 
-                    start_line, end_line = self.get_line_range(child)
-                    self.add_node(
-                        NodeSchema(
-                            id=type_id,
-                            label=type_name,
-                            type=sym_type,
-                            source_file=self.rel_path,
-                            line_start=start_line,
-                            line_end=end_line,
-                            signature=f"type {type_name} {sym_type}",
-                            docstring=self.parser._get_docstring(node, self.source),
-                        )
-                    )
-
-                    self.add_edge(
-                        EdgeSchema(
-                            source=self.file_node_id,
-                            target=type_id,
-                            relation="contains",
-                        )
+                    self.emit_symbol(
+                        node=child,
+                        name=type_name,
+                        sym_type=sym_type,
+                        symbol_id=type_id,
+                        parent_id=self.file_node_id,
+                        signature=f"type {type_name} {sym_type}",
+                        docstring=self.parser._get_docstring(node, self.source),
                     )
         self.generic_visit(node)
 
@@ -114,24 +66,14 @@ class GoVisitor:
             func_name = self.get_text(name_node)
             func_id = f"{self.rel_path}::{func_name}"
 
-            start_line, end_line = self.get_line_range(node)
-            self.add_node(
-                NodeSchema(
-                    id=func_id,
-                    label=func_name,
-                    type="function",
-                    source_file=self.rel_path,
-                    line_start=start_line,
-                    line_end=end_line,
-                    signature=self.parser._get_signature(node, self.source),
-                    docstring=self.parser._get_docstring(node, self.source),
-                )
-            )
-
-            self.add_edge(
-                EdgeSchema(
-                    source=self.file_node_id, target=func_id, relation="contains"
-                )
+            self.emit_symbol(
+                node=node,
+                name=func_name,
+                sym_type="function",
+                symbol_id=func_id,
+                parent_id=self.file_node_id,
+                signature=self.parser._get_signature(node, self.source),
+                docstring=self.parser._get_docstring(node, self.source),
             )
         self.generic_visit(node)
 
@@ -144,28 +86,18 @@ class GoVisitor:
             if receiver_type:
                 parent_id = f"{self.rel_path}::{receiver_type}"
                 method_id = f"{parent_id}.{method_name}"
-                relation = "contains"
             else:
                 parent_id = self.file_node_id
                 method_id = f"{self.rel_path}::{method_name}"
-                relation = "contains"
 
-            start_line, end_line = self.get_line_range(node)
-            self.add_node(
-                NodeSchema(
-                    id=method_id,
-                    label=method_name,
-                    type="method",
-                    source_file=self.rel_path,
-                    line_start=start_line,
-                    line_end=end_line,
-                    signature=self.parser._get_signature(node, self.source),
-                    docstring=self.parser._get_docstring(node, self.source),
-                )
-            )
-
-            self.add_edge(
-                EdgeSchema(source=parent_id, target=method_id, relation=relation)
+            self.emit_symbol(
+                node=node,
+                name=method_name,
+                sym_type="method",
+                symbol_id=method_id,
+                parent_id=parent_id,
+                signature=self.parser._get_signature(node, self.source),
+                docstring=self.parser._get_docstring(node, self.source),
             )
         self.generic_visit(node)
 
@@ -186,14 +118,7 @@ class GoVisitor:
             else:
                 import_map[pkg_name] = pkg_name
 
-            self.add_edge(
-                EdgeSchema(
-                    source=self.file_node_id,
-                    target=import_path,
-                    relation="imports",
-                    import_map=import_map,
-                )
-            )
+            self.emit_relation(self.file_node_id, import_path, "imports", import_map=import_map)
         self.generic_visit(node)
 
     def visit_call_expression(self, node: tree_sitter.Node) -> None:
@@ -218,9 +143,7 @@ class GoVisitor:
                     break
                 curr = curr.parent
 
-            self.add_edge(
-                EdgeSchema(source=caller_id, target=callee_name, relation="calls")
-            )
+            self.emit_relation(caller_id, callee_name, "calls")
         self.generic_visit(node)
 
 

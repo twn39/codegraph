@@ -6,59 +6,23 @@ from codegraph_gen.parser.base import (
     BaseParser,
     ASTVisitor,
     ASTParsingContext,
-    get_node_text,
-    get_line_range,
     register_parser,
 )
+from codegraph_gen.parser.common import VisitorMixin
 from codegraph_gen.schema import (
     ExtractionResult,
     NodeSchema,
-    EdgeSchema,
 )
 
 logger = logging.getLogger(__name__)
 
 
-class OCamlVisitor:
+class OCamlVisitor(VisitorMixin):
     traverser: ASTVisitor
 
     def __init__(self, ctx: ASTParsingContext, parser):
-        self.ctx = ctx
-        self.parser = parser
+        super().__init__(ctx, parser)
         self.file_node_id = ctx.rel_path
-
-    def get_text(self, node: tree_sitter.Node) -> str:
-        return get_node_text(node, self.ctx.source)
-
-    def get_line_range(self, node: tree_sitter.Node) -> tuple[int, int]:
-        return get_line_range(node)
-
-    def get_current_parent_id(self) -> str:
-        return self.ctx.scope.current_id
-
-    def add_node(self, node: NodeSchema) -> None:
-        self.ctx.add_node(node)
-
-    def add_edge(self, edge: EdgeSchema) -> None:
-        self.ctx.add_edge(edge)
-
-    @property
-    def scope(self):
-        return self.ctx.scope
-
-    @property
-    def source(self):
-        return self.ctx.source
-
-    @property
-    def rel_path(self):
-        return self.ctx.rel_path
-
-    def generic_visit(self, node: tree_sitter.Node) -> None:
-        self.traverser.generic_visit(node)
-
-    def visit(self, node: tree_sitter.Node) -> None:
-        self.traverser.visit(node)
 
     def visit_module_definition(self, node: tree_sitter.Node) -> None:
         module_binding = None
@@ -83,22 +47,14 @@ class OCamlVisitor:
                     else f"{self.rel_path}::{module_name}"
                 )
 
-                start_line, end_line = self.get_line_range(node)
-                self.add_node(
-                    NodeSchema(
-                        id=module_id,
-                        label=module_name,
-                        type="class",
-                        source_file=self.rel_path,
-                        line_start=start_line,
-                        line_end=end_line,
-                        signature=f"module {module_name}",
-                        docstring=self.parser._get_docstring(node, self.source),
-                    )
-                )
-
-                self.add_edge(
-                    EdgeSchema(source=parent_id, target=module_id, relation="contains")
+                self.emit_symbol(
+                    node=node,
+                    name=module_name,
+                    sym_type="class",
+                    symbol_id=module_id,
+                    parent_id=parent_id,
+                    signature=f"module {module_name}",
+                    docstring=self.parser._get_docstring(node, self.source),
                 )
 
                 with self.scope.push(module_id, "class"):
@@ -130,22 +86,14 @@ class OCamlVisitor:
                     else f"{self.rel_path}::{type_name}"
                 )
 
-                start_line, end_line = self.get_line_range(node)
-                self.add_node(
-                    NodeSchema(
-                        id=type_id,
-                        label=type_name,
-                        type="struct",
-                        source_file=self.rel_path,
-                        line_start=start_line,
-                        line_end=end_line,
-                        signature=f"type {type_name}",
-                        docstring=self.parser._get_docstring(node, self.source),
-                    )
-                )
-
-                self.add_edge(
-                    EdgeSchema(source=parent_id, target=type_id, relation="contains")
+                self.emit_symbol(
+                    node=node,
+                    name=type_name,
+                    sym_type="struct",
+                    symbol_id=type_id,
+                    parent_id=parent_id,
+                    signature=f"type {type_name}",
+                    docstring=self.parser._get_docstring(node, self.source),
                 )
 
                 with self.scope.push(type_id, "struct"):
@@ -227,23 +175,15 @@ class OCamlVisitor:
 
                 collect_local_bindings(node)
 
-                start_line, end_line = self.get_line_range(node)
-                self.add_node(
-                    NodeSchema(
-                        id=func_id,
-                        label=func_name,
-                        type="function",
-                        source_file=self.rel_path,
-                        line_start=start_line,
-                        line_end=end_line,
-                        signature=self.parser._get_signature(node, self.source),
-                        docstring=self.parser._get_docstring(node, self.source),
-                        local_bindings=local_bindings,
-                    )
-                )
-
-                self.add_edge(
-                    EdgeSchema(source=parent_id, target=func_id, relation="contains")
+                self.emit_symbol(
+                    node=node,
+                    name=func_name,
+                    sym_type="function",
+                    symbol_id=func_id,
+                    parent_id=parent_id,
+                    signature=self.parser._get_signature(node, self.source),
+                    docstring=self.parser._get_docstring(node, self.source),
+                    local_bindings=local_bindings,
                 )
 
                 with self.scope.push(func_id, "function"):
@@ -261,14 +201,7 @@ class OCamlVisitor:
 
         if module_path:
             module_name = self.get_text(module_path)
-            self.add_edge(
-                EdgeSchema(
-                    source=self.file_node_id,
-                    target=module_name,
-                    relation="imports",
-                    import_map={"*": "*"},
-                )
-            )
+            self.emit_relation(self.file_node_id, module_name, "imports", import_map={"*": "*"})
         self.generic_visit(node)
 
     def visit_include_module(self, node: tree_sitter.Node) -> None:
@@ -280,14 +213,7 @@ class OCamlVisitor:
 
         if module_path:
             module_name = self.get_text(module_path)
-            self.add_edge(
-                EdgeSchema(
-                    source=self.file_node_id,
-                    target=module_name,
-                    relation="imports",
-                    import_map={"*": "*"},
-                )
-            )
+            self.emit_relation(self.file_node_id, module_name, "imports", import_map={"*": "*"})
         self.generic_visit(node)
 
     def visit_application_expression(self, node: tree_sitter.Node) -> None:
@@ -296,9 +222,7 @@ class OCamlVisitor:
             if func_node.type == "value_path":
                 callee_name = self.get_text(func_node)
                 caller_id = self.get_current_parent_id()
-                self.add_edge(
-                    EdgeSchema(source=caller_id, target=callee_name, relation="calls")
-                )
+                self.emit_relation(caller_id, callee_name, "calls")
         self.generic_visit(node)
 
 
