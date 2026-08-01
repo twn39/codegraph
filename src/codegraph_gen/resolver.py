@@ -361,6 +361,7 @@ class TypeResolver:
             node_ids=frozenset(self.node_ids),
             graph_nodes=self.G.nodes,
             global_symbol_map=MappingProxyType(self.global_symbol_map),
+            return_types=MappingProxyType(self.return_types),
         )
 
         resolver_chain = (

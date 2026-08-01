@@ -29,6 +29,7 @@ def make_test_context(
     node_ids=None,
     graph_nodes=None,
     global_symbol_map=None,
+    return_types=None,
 ):
     strategy = get_strategy_by_name(strategy_name)
     scope = FileSymbolScope(source_file, strategy_name)
@@ -56,6 +57,7 @@ def make_test_context(
         node_ids=frozenset(node_ids or set()),
         graph_nodes=graph_nodes or {},
         global_symbol_map=MappingProxyType(global_symbol_map or {}),
+        return_types=MappingProxyType(return_types or {}),
     )
 
 

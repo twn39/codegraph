@@ -497,8 +497,14 @@ class MarkdownRenderer:
         cohesion_scores: dict,
         component_names: dict,
         analysis: AnalysisResult,
+        language: str = "en",
     ) -> str:
-        """Renders the AGENT_PROMPT.md template."""
+        """Renders the AGENT_PROMPT.md template.
+
+        ``language`` selects the instruction language: ``en`` (default) or ``zh``.
+        The report must always be written under the English section heading
+        ``## AI Architectural Insights`` so rebuilds can preserve prior insights.
+        """
         files_count = sum(1 for _, d in G.nodes(data=True) if d.get("type") == "file")
         symbols_count = G.number_of_nodes() - files_count
 
@@ -520,7 +526,11 @@ class MarkdownRenderer:
         cycle_list = []
         for c in analysis.cycles:
             cycle_list.append(" -> ".join(c + [c[0]]))
-        cycle_str = "\n".join(cycle_list) if cycle_list else "无循环依赖"
+        lang = (language or "en").lower()
+        if lang.startswith("zh"):
+            cycle_str = "\n".join(cycle_list) if cycle_list else "无循环依赖"
+        else:
+            cycle_str = "\n".join(cycle_list) if cycle_list else "No circular imports"
 
         # Generate Mermaid component graph
         mermaid_lines = ["flowchart TD"]
@@ -542,9 +552,12 @@ class MarkdownRenderer:
                 mermaid_lines.append(f'  {cid_id}["{name}"]')
         mermaid_graph = "\n".join(mermaid_lines)
 
-        prompt = f"""# Codebase Architecture Analysis Prompt
+        if lang.startswith("zh"):
+            prompt = f"""# Codebase Architecture Analysis Prompt
 
 你是一个资深的软件架构专家。根据下面提供的代码库知识图谱元数据和主要组件之间的关系，为该项目撰写一份深刻的“AI 架构深度洞察分析报告”（使用中文书写）。
+
+**重要**：将完整报告写入 `.codegraph/README.md` 的 `## AI Architectural Insights` 章节（章节标题保持英文，便于工具保留历史洞察）。
 
 【代码库图谱数据统计】
 - 物理文件数: {files_count}
@@ -572,5 +585,39 @@ class MarkdownRenderer:
 3. **潜在瓶颈与架构重构建议**：指出高耦合风险点、循环依赖负面影响，并给出具体、可操作的重构优化方案（如解耦、提取接口、依赖倒置等）。
 
 请以标准的 Markdown 格式输出，排版要清晰美观、专业严谨，不要包含首尾的 ```markdown 和 ``` 语法包裹标记，直接输出内容。
+"""
+        else:
+            prompt = f"""# Codebase Architecture Analysis Prompt
+
+You are a senior software architect. Using the knowledge-graph metadata and component relationships below, write a deep **AI Architectural Insights** report for this project **in English**.
+
+**Important**: Write the full report into the `## AI Architectural Insights` section of `.codegraph/README.md` (keep this English heading so rebuilds can preserve prior insights).
+
+## Graph statistics
+- Files: {files_count}
+- Symbols (classes/functions/methods): {symbols_count}
+- Edges: {G.number_of_edges()}
+{self._format_resolution_prompt_block(analysis)}
+
+## Logical components (modularity)
+{comp_str}
+
+## Component dependency graph (Mermaid)
+```mermaid
+{mermaid_graph}
+```
+
+## God nodes (highest degree)
+{god_str}
+
+## File-level import cycles
+{cycle_str}
+
+Focus your analysis on:
+1. **System architecture** — design patterns, modularity, physical vs logical alignment.
+2. **Core abstractions & boundaries** — which god nodes are healthy hubs vs fat objects.
+3. **Bottlenecks & refactoring** — coupling risks, cycle impact, concrete decoupling steps.
+
+Output standard Markdown only (no surrounding ```markdown fences).
 """
         return prompt

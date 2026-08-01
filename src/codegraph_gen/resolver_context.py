@@ -116,3 +116,7 @@ class ResolutionContext:
 
     global_symbol_map: MappingProxyType  # MappingProxyType[str, list[str]]
     """Read-only mapping from label → list of node IDs with that label."""
+
+    return_types: MappingProxyType  # MappingProxyType[str, str]
+    """Read-only map of function/method node id → declared return type name.
+    Used for multi-hop attribute chains such as ``o.inner().value()``."""

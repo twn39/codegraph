@@ -4,5 +4,7 @@
   "output": ".codegraph",
   "languages": ["python"],
   "workers": 4,
-  "cache": true
+  "cache": true,
+  "min_internal_resolve_rate": 0.95,
+  "max_internal_unresolved_edges": 20
 }

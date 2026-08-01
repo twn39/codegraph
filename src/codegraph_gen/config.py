@@ -106,6 +106,12 @@ class ProjectConfig(BaseModel):
     max_internal_unresolved_edges: Optional[int] = None
     """CI gate: fail if unresolved *internal* edge count exceeds this."""
 
+    strict: bool = False
+    """When true, fail the build if any source file fails to parse."""
+
+    report_language: str = "en"
+    """Language for AGENT_PROMPT / AI insights guidance: en | zh."""
+
 
 def load_project_config(workspace_dir: Path) -> Optional[ProjectConfig]:
     """
@@ -156,6 +162,10 @@ class CodegraphConfig(BaseModel):
     """If set, pipeline raises when internal_resolve_rate is below this threshold."""
     max_internal_unresolved_edges: Optional[int] = Field(default=None)
     """If set, pipeline raises when unresolved internal edges exceed this count."""
+    strict: bool = Field(default=False)
+    """If true, pipeline raises when any file fails to parse."""
+    report_language: str = Field(default="en")
+    """Agent prompt language: en | zh."""
 
     @property
     def absolute_output_dir(self) -> Path:

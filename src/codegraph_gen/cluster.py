@@ -71,14 +71,19 @@ def _candidate_name(
     naming_mode:
       - package: prefer directory path
       - symbol: prefer central symbol label
-      - hybrid: package when present, else symbol (default)
+      - hybrid: ``package (symbol)`` when both known, else best available (default)
     """
     mode = (naming_mode or "hybrid").lower()
     if mode == "symbol":
         return clean_name
     if mode == "package":
         return _short_package(common_dir) if common_dir else clean_name
-    # hybrid
+    # hybrid — combine package path with hub symbol for agent-readable names
+    if common_dir and clean_name:
+        pkg = _short_package(common_dir)
+        if pkg and pkg != clean_name and not clean_name.startswith(pkg):
+            return f"{pkg} ({clean_name})"
+        return pkg or clean_name
     if common_dir:
         return _short_package(common_dir)
     return clean_name

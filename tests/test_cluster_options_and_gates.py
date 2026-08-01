@@ -65,6 +65,31 @@ def test_include_tests_in_clustering_changes_membership():
     assert sum(len(m) for m in comps_in.values()) == G.number_of_nodes()
 
 
+def test_strict_mode_raises_on_parse_errors(tmp_path: Path, monkeypatch):
+    """Strict mode should fail when the parse stage records errors."""
+    from codegraph_gen.engine import CodegraphEngine
+
+    config = CodegraphConfig(
+        workspace_dir=tmp_path,
+        output_dir=tmp_path / ".codegraph",
+        languages={"python"},
+        use_cache=False,
+        strict=True,
+    )
+    engine = CodegraphEngine()
+
+    def fake_parse(self, cfg, files, cache_path, progress_callback):
+        return [], set(), {}, ["broken.py: SyntaxError"]
+
+    monkeypatch.setattr(CodegraphEngine, "_parse_with_cache", fake_parse)
+    monkeypatch.setattr(
+        "codegraph_gen.engine.discover_files",
+        lambda *a, **k: [(tmp_path / "broken.py", "python")],
+    )
+    with pytest.raises(RuntimeError, match="Strict mode"):
+        engine.run_pipeline(config)
+
+
 def test_min_resolve_rate_gate(tmp_path: Path):
     src = tmp_path / "m.py"
     src.write_text("def f():\n    missing()\n", encoding="utf-8")

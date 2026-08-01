@@ -111,17 +111,101 @@ class VisitorMixin:
         )
 
 
+# Typing wrappers whose first type argument is the meaningful bound type.
+_UNWRAP_GENERIC_HEADS: frozenset[str] = frozenset(
+    {
+        "Optional",
+        "Union",
+        "Annotated",
+        "Final",
+        "ClassVar",
+        "Required",
+        "NotRequired",
+        "Readonly",
+        "Type",
+        "type",
+    }
+)
+
+
+def _first_type_param_name(node: tree_sitter.Node, get_text) -> str | None:
+    """Extract the first meaningful type argument from a generic type_parameter."""
+    for child in node.children:
+        if child.type in ("[", "]", ",", "type_parameter"):
+            if child.type == "type_parameter":
+                inner = _first_type_param_name(child, get_text)
+                if inner:
+                    return inner
+            continue
+        if child.type == "none":
+            continue
+        name = extract_type_name(child, get_text)
+        if name and name not in ("None", "none", "..."):
+            return name
+    return None
+
+
 def extract_type_name(node: tree_sitter.Node, get_text) -> str | None:
-    """Best-effort type name from identifier / attribute / call / type wrappers."""
+    """Best-effort type name from identifier / attribute / call / type wrappers.
+
+    Handles common Python typing forms:
+    - ``Optional[Client]`` / ``Union[Client, None]`` → ``Client``
+    - ``Client | None`` → ``Client``
+    - ``\"Client\"`` / ``'Client'`` forward refs → ``Client``
+    - ``list[Client]`` keeps the outer container head only when it is not a
+      pure wrapper (so callers still see ``list``); wrappers above unwrap.
+    """
     if node is None:
         return None
     if node.type == "identifier":
         return get_text(node)
+    if node.type == "none":
+        return None
+    if node.type == "string":
+        # Forward references: "Client" / 'Client'
+        raw = get_text(node).strip()
+        if len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]:
+            return raw[1:-1].strip() or None
+        for child in node.children:
+            if child.type == "string_content":
+                text = get_text(child).strip()
+                return text or None
+        return None
     if node.type == "attribute":
+        # Prefer full dotted path for pkg.mod.Client when useful; fall back to leaf
+        full = get_text(node)
+        if full and "." in full:
+            return full
         attr_node = node.child_by_field_name("attribute")
         if attr_node:
             return get_text(attr_node)
-        return get_text(node)
+        return full
+    if node.type == "generic_type":
+        head = None
+        type_param = None
+        for child in node.children:
+            if child.type == "identifier":
+                head = get_text(child)
+            elif child.type == "attribute":
+                head = extract_type_name(child, get_text)
+            elif child.type == "type_parameter":
+                type_param = child
+        if head in _UNWRAP_GENERIC_HEADS and type_param is not None:
+            inner = _first_type_param_name(type_param, get_text)
+            if inner:
+                return inner
+        if head:
+            return head
+    if node.type == "binary_operator":
+        # PEP 604 unions: Client | None
+        names: list[str] = []
+        for child in node.children:
+            if child.type in ("|",):
+                continue
+            name = extract_type_name(child, get_text)
+            if name and name not in ("None", "none"):
+                names.append(name)
+        return names[0] if names else None
     if node.type == "type":
         for child in node.children:
             res = extract_type_name(child, get_text)

@@ -15,13 +15,17 @@ from codegraph_gen.cluster import detect_components
 from codegraph_gen.config import CacheEntry, CodegraphConfig
 from codegraph_gen.detect import discover_files
 from codegraph_gen.incremental import (
+    PIPELINE_SNAPSHOT_NAME,
     SIGNATURE_STORE_NAME,
     component_signature,
     import_dependents,
+    load_pipeline_snapshot,
     load_signature_store,
     node_neighborhood_signature,
+    save_pipeline_snapshot,
     save_signature_store,
     should_force_render_node,
+    workspace_fingerprint,
 )
 from codegraph_gen.parser import get_parser
 from codegraph_gen.renderer import (
@@ -29,6 +33,7 @@ from codegraph_gen.renderer import (
     get_component_filename,
     get_node_filename,
 )
+from codegraph_gen.pipeline_stages import PipelineContext, notify
 from codegraph_gen.schema import ExtractionResult
 from codegraph_gen.writer import VaultWriter
 
@@ -87,6 +92,7 @@ class PipelineResult(BaseModel):
     cohesion_scores: Dict[int, float]
     component_names: Dict[int, str]
     analysis: AnalysisResult
+    parse_errors: List[str] = []
 
 
 class CodegraphEngine:
@@ -98,22 +104,22 @@ class CodegraphEngine:
         config: CodegraphConfig,
         progress_callback: Optional[ProgressCallback] = None,
     ) -> PipelineResult:
-        """Run the full codegraph generation pipeline as an ordered stage list."""
+        """Run the full codegraph generation pipeline as ordered stages."""
         logger.info("Starting codegraph engine pipeline...")
+        ctx = PipelineContext(config=config, progress_callback=progress_callback)
         renderer = MarkdownRenderer(config.workspace_dir)
 
-        if progress_callback:
-            progress_callback(PipelineStage.DISCOVERING, None, 0, 0)
-        files = discover_files(
+        # Stage 1 — Discover
+        notify(ctx, PipelineStage.DISCOVERING)
+        ctx.files = discover_files(
             config.workspace_dir,
             config.languages,
             config.exclusions,
             config.include_dirs,
         )
-        if not files:
+        if not ctx.files:
             logger.warning("No supported files found.")
-            if progress_callback:
-                progress_callback(PipelineStage.COMPLETED, None, 0, 0)
+            notify(ctx, PipelineStage.COMPLETED)
             return PipelineResult(
                 graph=nx.DiGraph(),
                 files=[],
@@ -121,89 +127,181 @@ class CodegraphEngine:
                 cohesion_scores={},
                 component_names={},
                 analysis=AnalysisResult(god_nodes=[], cycles=[], inter_comp_deps={}),
+                parse_errors=[],
             )
 
-        cache_path = config.absolute_output_dir / "cache.json"
-        extractions, dirty_files, new_cache_entries = self._parse_with_cache(
-            config, files, cache_path, progress_callback
+        # Stage 2 — Parse (cached)
+        ctx.cache_path = config.absolute_output_dir / "cache.json"
+        (
+            ctx.extractions,
+            ctx.dirty_files,
+            ctx.cache_entries,
+            ctx.parse_errors,
+        ) = self._parse_with_cache(
+            config, ctx.files, ctx.cache_path, progress_callback
         )
+        self._enforce_parse_errors(config, ctx.parse_errors)
 
-        if progress_callback:
-            progress_callback(PipelineStage.BUILDING, None, 0, 0)
-        G = build_graph(extractions, config.workspace_dir)
-
-        if progress_callback:
-            progress_callback(PipelineStage.CLUSTERING, None, 0, 0)
-        components, cohesion_scores, component_names = detect_components(
-            G,
-            exclude_tests_from_clustering=config.exclude_tests_from_clustering,
+        # Fingerprint of the workspace content + clustering knobs
+        file_hashes = {
+            rel: entry.hash
+            for rel, entry in ctx.cache_entries.items()
+            if entry.hash
+        }
+        include_names = (
+            [str(p.relative_to(config.workspace_dir)) for p in config.include_dirs]
+            if config.include_dirs
+            else None
+        )
+        fingerprint = workspace_fingerprint(
+            file_hashes,
+            languages=config.languages,
+            exclusions=config.exclusions,
+            include_dirs=include_names,
             naming_mode=config.component_naming,
+            exclude_tests_from_clustering=config.exclude_tests_from_clustering,
         )
+        snapshot_path = config.absolute_output_dir / PIPELINE_SNAPSHOT_NAME
+        reused_snapshot = False
 
-        if progress_callback:
-            progress_callback(PipelineStage.ANALYZING, None, 0, 0)
-        analysis = analyze_graph(G, components)
+        # Fast path: no dirty files + matching snapshot → skip resolve/cluster/analyze
+        if config.use_cache and not ctx.dirty_files:
+            snap = load_pipeline_snapshot(snapshot_path, fingerprint)
+            if snap is not None:
+                ctx.graph = snap.graph
+                ctx.components = snap.components
+                ctx.cohesion_scores = snap.cohesion_scores
+                ctx.component_names = snap.component_names
+                ctx.analysis = snap.analysis
+                reused_snapshot = True
+                ctx.graph.graph["pipeline_reused_snapshot"] = True
+                logger.info("Skipped build/cluster/analyze (pipeline snapshot hit).")
+
+        if not reused_snapshot:
+            # Stage 3 — Build graph + resolve symbols
+            notify(ctx, PipelineStage.BUILDING)
+            ctx.graph = build_graph(ctx.extractions, config.workspace_dir)
+
+            # Stage 4 — Cluster
+            notify(ctx, PipelineStage.CLUSTERING)
+            (
+                ctx.components,
+                ctx.cohesion_scores,
+                ctx.component_names,
+            ) = detect_components(
+                ctx.graph,
+                exclude_tests_from_clustering=config.exclude_tests_from_clustering,
+                naming_mode=config.component_naming,
+            )
+
+            # Stage 5 — Analyze
+            notify(ctx, PipelineStage.ANALYZING)
+            ctx.analysis = analyze_graph(ctx.graph, ctx.components)
+            ctx.graph.graph["pipeline_reused_snapshot"] = False
+        else:
+            # Still surface analyzing stage so progress UIs stay consistent
+            notify(ctx, PipelineStage.ANALYZING)
+
+        analysis = ctx.analysis
+        if analysis is None:
+            raise RuntimeError("Pipeline analysis stage produced no result")
+
+        # Quality gates always run (including snapshot reuse)
         self._enforce_quality_gates(config, analysis.resolution)
 
-        if progress_callback:
-            progress_callback(PipelineStage.RENDERING, None, 0, 0)
-        rendered_nodes, rendered_components, new_sigs = self._render_incremental(
+        # Stage 6 — Render vault pages
+        notify(ctx, PipelineStage.RENDERING)
+        (
+            ctx.rendered_nodes,
+            ctx.rendered_components,
+            ctx.new_signatures,
+        ) = self._render_incremental(
             config,
             renderer,
-            G,
-            components,
-            cohesion_scores,
-            component_names,
+            ctx.graph,
+            ctx.components,
+            ctx.cohesion_scores,
+            ctx.component_names,
             analysis,
-            dirty_files,
+            ctx.dirty_files,
         )
 
         ai_insights = self._load_preserved_ai_insights(config.absolute_output_dir)
-        readme_content = renderer.render_readme(
-            G,
-            components,
-            cohesion_scores,
-            component_names,
+        ctx.readme_content = renderer.render_readme(
+            ctx.graph,
+            ctx.components,
+            ctx.cohesion_scores,
+            ctx.component_names,
             analysis,
             ai_insights=ai_insights,
         )
-        prompt_content = renderer.render_agent_prompt(
-            G, components, cohesion_scores, component_names, analysis
+        ctx.prompt_content = renderer.render_agent_prompt(
+            ctx.graph,
+            ctx.components,
+            ctx.cohesion_scores,
+            ctx.component_names,
+            analysis,
+            language=config.report_language,
         )
 
-        if progress_callback:
-            progress_callback(PipelineStage.WRITING, None, 0, 0)
+        # Stage 7 — Write vault + exports
+        notify(ctx, PipelineStage.WRITING)
         write_stats = self.writer.write_vault(
             config.absolute_output_dir,
-            rendered_nodes,
-            rendered_components,
-            readme_content,
-            prompt_content,
+            ctx.rendered_nodes,
+            ctx.rendered_components,
+            ctx.readme_content,
+            ctx.prompt_content,
         )
-        G.graph["vault_write_stats"] = {
+        ctx.graph.graph["vault_write_stats"] = {
             "written": write_stats.written,
             "skipped": write_stats.skipped,
             "removed": write_stats.removed,
         }
+        if ctx.parse_errors:
+            ctx.graph.graph["parse_errors"] = list(ctx.parse_errors)
 
         self._export_json_if_enabled(
-            config, G, components, cohesion_scores, component_names, analysis
+            config,
+            ctx.graph,
+            ctx.components,
+            ctx.cohesion_scores,
+            ctx.component_names,
+            analysis,
         )
         self._save_cache_and_signatures(
-            config, cache_path, new_cache_entries, new_sigs
+            config, ctx.cache_path, ctx.cache_entries, ctx.new_signatures
         )
+        # Persist pipeline snapshot for next no-dirty rebuild (always refresh
+        # when we rebuilt; when reusing, fingerprint already matches file).
+        if config.use_cache and not reused_snapshot:
+            try:
+                save_pipeline_snapshot(
+                    snapshot_path,
+                    fingerprint=fingerprint,
+                    G=ctx.graph,
+                    components=ctx.components,
+                    cohesion_scores=ctx.cohesion_scores,
+                    component_names=ctx.component_names,
+                    analysis=analysis,
+                )
+            except Exception as e:
+                logger.warning("Could not write pipeline snapshot: %s", e)
 
-        if progress_callback:
-            progress_callback(PipelineStage.COMPLETED, None, 0, 0)
-
-        logger.info("Pipeline executed successfully.")
+        notify(ctx, PipelineStage.COMPLETED)
+        logger.info(
+            "Pipeline executed successfully (parse_errors=%s, snapshot_reused=%s).",
+            len(ctx.parse_errors),
+            reused_snapshot,
+        )
         return PipelineResult(
-            graph=G,
-            files=files,
-            components=components,
-            cohesion_scores=cohesion_scores,
-            component_names=component_names,
+            graph=ctx.graph,
+            files=ctx.files,
+            components=ctx.components,
+            cohesion_scores=ctx.cohesion_scores,
+            component_names=ctx.component_names,
             analysis=analysis,
+            parse_errors=ctx.parse_errors,
         )
 
     # ── Stage helpers ──────────────────────────────────────────────────────
@@ -228,8 +326,11 @@ class CodegraphEngine:
         files: list[tuple[Path, str]],
         cache_path: Path,
         progress_callback: Optional[ProgressCallback],
-    ) -> tuple[list[ExtractionResult], set[str], dict[str, CacheEntry]]:
-        """Parse files with optional disk cache; return extractions, dirty set, cache map."""
+    ) -> tuple[list[ExtractionResult], set[str], dict[str, CacheEntry], list[str]]:
+        """Parse files with optional disk cache.
+
+        Returns extractions, dirty file set, updated cache map, and parse error messages.
+        """
         total_files = len(files)
         cache_entries = (
             self._load_cache_entries(cache_path) if config.use_cache else {}
@@ -238,6 +339,7 @@ class CodegraphEngine:
         files_to_parse: list[tuple[Path, str, str, float, int, str]] = []
         new_cache_entries: dict[str, CacheEntry] = {}
         dirty_files: set[str] = set()
+        parse_errors: list[str] = []
 
         for file_path, lang in files:
             rel_path = str(file_path.relative_to(config.workspace_dir))
@@ -289,7 +391,7 @@ class CodegraphEngine:
                 progress_callback(
                     PipelineStage.PARSING, None, total_files, total_files
                 )
-            return extractions, dirty_files, new_cache_entries
+            return extractions, dirty_files, new_cache_entries, parse_errors
 
         max_workers = config.max_workers
         if max_workers > 1 and len(files_to_parse) > 1:
@@ -325,6 +427,8 @@ class CodegraphEngine:
                     try:
                         _, result, err_msg = future.result()
                         if err_msg:
+                            msg = f"{rel_path}: {err_msg}"
+                            parse_errors.append(msg)
                             logger.error(
                                 f"Error parsing file {file_path} in worker: {err_msg}"
                             )
@@ -338,6 +442,8 @@ class CodegraphEngine:
                                     result=result,
                                 )
                     except Exception as e:
+                        msg = f"{rel_path}: {e}"
+                        parse_errors.append(msg)
                         logger.error(f"Failed to parse file {file_path}: {e}")
         else:
             logger.info(f"Parsing {len(files_to_parse)} files sequentially...")
@@ -363,9 +469,31 @@ class CodegraphEngine:
                             mtime=mtime, size=size, hash=file_hash, result=result
                         )
                 except Exception as e:
+                    msg = f"{rel_path}: {e}"
+                    parse_errors.append(msg)
                     logger.error(f"Error parsing file {file_path}: {e}")
 
-        return extractions, dirty_files, new_cache_entries
+        if parse_errors:
+            logger.warning(
+                "Parse completed with %s error(s). First: %s",
+                len(parse_errors),
+                parse_errors[0][:200],
+            )
+
+        return extractions, dirty_files, new_cache_entries, parse_errors
+
+    @staticmethod
+    def _enforce_parse_errors(config: CodegraphConfig, parse_errors: list[str]) -> None:
+        """Raise when --strict (or config.strict) and any parse failures occurred."""
+        if not parse_errors:
+            return
+        summary = "; ".join(parse_errors[:5])
+        if len(parse_errors) > 5:
+            summary += f" … (+{len(parse_errors) - 5} more)"
+        if config.strict:
+            raise RuntimeError(
+                f"Strict mode: {len(parse_errors)} file(s) failed to parse. {summary}"
+            )
 
     @staticmethod
     def _enforce_quality_gates(

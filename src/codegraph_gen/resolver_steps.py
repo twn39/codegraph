@@ -253,7 +253,38 @@ def _find_method_on_class(
     return None
 
 
+def _strip_call_segment(segment: str) -> str:
+    """Normalize ``inner()`` / ``inner(x)`` segments to the bare name."""
+    name = segment.strip()
+    if "(" in name:
+        name = name.split("(", 1)[0].strip()
+    return name
+
+
+def _transfer_return_type(
+    method_id: str,
+    ctx: ResolutionContext,
+) -> str | None:
+    """Map a method/function node to its return type class id when known."""
+    ret_name = None
+    if ctx.return_types:
+        ret_name = ctx.return_types.get(method_id)
+    if not ret_name:
+        # Fall back to signature extraction via graph node fields is not available
+        # here; TypeResolver pre-fills return_types for all methods.
+        return None
+    return _lookup_class_id(
+        ret_name,
+        source_file=ctx.graph_nodes[method_id].get("source_file", ctx.source_file),
+        scope=ctx.scope,
+        node_ids=ctx.node_ids,
+        graph_nodes=ctx.graph_nodes,
+        strategy=ctx.strategy,
+    )
+
+
 def _resolve_local_binding_impl(ctx: ResolutionContext) -> str | None:
+    """Resolve ``foo.bar`` / ``foo.bar().baz()`` chains via typed locals + return types."""
     receiver_type = ctx.local_bindings[ctx.main_symbol]
     parts = ctx.parts
 
@@ -268,14 +299,40 @@ def _resolve_local_binding_impl(ctx: ResolutionContext) -> str | None:
     if not resolved_class_id:
         return None
 
-    return _find_method_on_class(
-        resolved_class_id,
-        parts[-1],
-        ctx.rest_of_callee,
-        node_ids=ctx.node_ids,
-        graph_nodes=ctx.graph_nodes,
-        receiver_type=receiver_type,
-    )
+    segments = list(parts[1:])
+    if not segments:
+        return resolved_class_id
+
+    current_class_id = resolved_class_id
+    current_receiver_type = receiver_type
+    last_method_id: str | None = None
+
+    for index, segment in enumerate(segments):
+        method_name = _strip_call_segment(segment)
+        if not method_name:
+            return None
+        method_id = _find_method_on_class(
+            current_class_id,
+            method_name,
+            method_name,
+            node_ids=ctx.node_ids,
+            graph_nodes=ctx.graph_nodes,
+            receiver_type=current_receiver_type,
+        )
+        if not method_id:
+            return last_method_id if index == 0 else None
+        last_method_id = method_id
+        is_last = index == len(segments) - 1
+        if is_last:
+            return method_id
+        # Intermediate call/attribute: advance receiver via declared return type
+        next_class = _transfer_return_type(method_id, ctx)
+        if not next_class:
+            return None
+        current_class_id = next_class
+        current_receiver_type = ctx.graph_nodes[next_class].get("label", next_class)
+
+    return last_method_id
 
 
 # ---------------------------------------------------------------------------

@@ -60,7 +60,7 @@ fn boot() {
 }
 """,
         {"App", "run", "boot", "lib.rs"},
-        {"contains"},
+        {"contains", "calls"},
     ),
     "javascript": (
         "app.js",
@@ -79,6 +79,99 @@ function boot() {
 """,
         {"App", "start", "ready", "boot", "app.js"},
         {"contains", "calls"},
+    ),
+    "typescript": (
+        "app.ts",
+        """
+class App {
+  start(): void {
+    this.ready();
+  }
+  ready(): void {}
+}
+
+function boot(): void {
+  const a = new App();
+  a.start();
+}
+""",
+        {"App", "start", "ready", "boot", "app.ts"},
+        {"contains", "calls"},
+    ),
+    "kotlin": (
+        "App.kt",
+        """
+class App {
+    fun start() {
+        ready()
+    }
+    fun ready() {}
+}
+
+fun boot() {
+    val a = App()
+    a.start()
+}
+""",
+        {"App", "start", "ready", "boot", "App.kt"},
+        {"contains", "calls"},
+    ),
+    "swift": (
+        "App.swift",
+        """
+class App {
+    func start() {
+        ready()
+    }
+    func ready() {}
+}
+
+func boot() {
+    let a = App()
+    a.start()
+}
+""",
+        {"App", "start", "ready", "boot", "App.swift"},
+        {"contains", "calls"},
+    ),
+    "c": (
+        "main.c",
+        """
+void helper(void) {}
+
+int main(void) {
+    helper();
+    return 0;
+}
+""",
+        {"helper", "main", "main.c"},
+        {"contains", "calls"},
+    ),
+    "cpp": (
+        "main.cpp",
+        """
+class App {
+public:
+    void run() {}
+};
+
+void boot() {
+    App a;
+    a.run();
+}
+""",
+        {"App", "run", "boot", "main.cpp"},
+        {"contains"},
+    ),
+    "ocaml": (
+        "app.ml",
+        """
+let helper x = x + 1
+
+let boot () = helper 1
+""",
+        {"helper", "boot", "app.ml"},
+        {"contains"},
     ),
 }
 
@@ -102,7 +195,10 @@ def test_language_golden_parse(tmp_path: Path, lang: str):
     )
 
 
-@pytest.mark.parametrize("lang", ["python", "go", "rust", "javascript"])
+@pytest.mark.parametrize(
+    "lang",
+    ["python", "go", "rust", "javascript", "typescript", "kotlin", "swift", "c"],
+)
 def test_language_golden_resolution_rate(tmp_path: Path, lang: str):
     filename, source, _, _ = FIXTURES[lang]
     path = tmp_path / filename
@@ -127,6 +223,11 @@ def test_language_golden_resolution_rate(tmp_path: Path, lang: str):
         ("python", {"run"}),
         ("go", {"Start"}),
         ("javascript", {"start"}),
+        ("typescript", {"start"}),
+        ("rust", {"run"}),
+        ("kotlin", {"start"}),
+        ("swift", {"start"}),
+        ("c", {"helper"}),
     ],
 )
 def test_language_golden_key_call_edges(
