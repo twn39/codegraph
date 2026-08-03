@@ -134,6 +134,7 @@ class MarkdownRenderer:
             ".swift": "swift",
             ".kt": "kotlin",
             ".kts": "kotlin",
+            ".dart": "dart",
         }
         code_lang = lang_map.get(lang_ext, "")
 

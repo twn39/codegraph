@@ -173,6 +173,21 @@ let boot () = helper 1
         {"helper", "boot", "app.ml"},
         {"contains"},
     ),
+    "dart": (
+        "main.dart",
+        """
+class App {
+  void run() {}
+}
+
+void boot() {
+  final a = App();
+  a.run();
+}
+""",
+        {"App", "run", "boot", "main.dart"},
+        {"contains"},
+    ),
 }
 
 

@@ -7,6 +7,7 @@ from codegraph_gen.resolver_strategy.base import (
     extract_arrow_return_type,
 )
 from codegraph_gen.resolver_strategy.c_cpp import CppStrategy, CStrategy
+from codegraph_gen.resolver_strategy.dart import DartStrategy
 from codegraph_gen.resolver_strategy.go import GoStrategy
 from codegraph_gen.resolver_strategy.javascript import (
     JavaScriptStrategy,
@@ -37,6 +38,7 @@ for strategy_cls in [
     CStrategy,
     CppStrategy,
     OCamlStrategy,
+    DartStrategy,
 ]:
     inst = strategy_cls()
     _STRATEGY_BY_NAME[inst.name] = inst
@@ -65,6 +67,7 @@ __all__ = [
     "CStrategy",
     "CppStrategy",
     "OCamlStrategy",
+    "DartStrategy",
     "get_strategy_for_file",
     "get_strategy_by_name",
     "extract_arrow_return_type",

@@ -555,7 +555,7 @@ def info():
     """Prints tool info and supported languages."""
     console.print(f"[bold]codegraph v{__version__}[/bold]")
     console.print(
-        "Supported languages: Python, JavaScript, TypeScript, Kotlin, Go, Rust, Swift, C, C++, OCaml"
+        "Supported languages: Python, JavaScript, TypeScript, Kotlin, Go, Rust, Swift, C, C++, OCaml, Dart"
     )
 
 
