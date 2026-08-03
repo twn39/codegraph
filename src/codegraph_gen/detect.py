@@ -62,7 +62,13 @@ def discover_files(
                 elif item.is_file():
                     ext = item.suffix.lower()
                     if ext in ext_to_lang:
-                        found_files.append((item.resolve(), ext_to_lang[ext]))
+                        resolved_path = item.resolve()
+                        try:
+                            resolved_path.relative_to(workspace)
+                            found_files.append((resolved_path, ext_to_lang[ext]))
+                        except ValueError:
+                            # Skip symlink target that lies outside workspace
+                            continue
         except PermissionError:
             logger.warning(f"Permission denied: {directory}")
         except Exception as e:

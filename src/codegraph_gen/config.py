@@ -40,6 +40,8 @@ DEFAULT_EXCLUSIONS = {
     "build_mac",
     "build_ios",
     "build_ios_sim",
+    ".dart_tool",
+    ".pub-cache",
 }
 
 
