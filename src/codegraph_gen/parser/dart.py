@@ -192,6 +192,10 @@ class DartVisitor(VisitorMixin):
             self.generic_visit(node)
 
     def visit_method_signature(self, node: tree_sitter.Node) -> None:
+        for child in node.children:
+            if child.type == "factory_constructor_signature":
+                self._visit_constructor(child)
+                return
         self._visit_function_or_method(node)
 
     def visit_function_signature(self, node: tree_sitter.Node) -> None:
@@ -202,11 +206,24 @@ class DartVisitor(VisitorMixin):
         self._visit_function_or_method(node)
 
     def visit_constructor_signature(self, node: tree_sitter.Node) -> None:
+        self._visit_constructor(node)
+
+    def visit_factory_constructor_signature(self, node: tree_sitter.Node) -> None:
+        self._visit_constructor(node)
+
+    def _visit_constructor(self, node: tree_sitter.Node) -> None:
         parent_id = self.get_current_parent_id()
-        name_node = node.child_by_field_name("name")
-        ctor_suffix = self.get_text(name_node) if name_node else "new"
-        class_name = parent_id.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
-        ctor_name = f"{class_name}.{ctor_suffix}" if ctor_suffix != "new" else class_name
+        identifiers = [self.get_text(c) for c in node.children if c.type == "identifier"]
+        if len(identifiers) >= 2:
+            ctor_name = f"{identifiers[0]}.{identifiers[1]}"
+            ctor_suffix = identifiers[1]
+        elif len(identifiers) == 1:
+            ctor_name = identifiers[0]
+            ctor_suffix = identifiers[0]
+        else:
+            ctor_name = "constructor"
+            ctor_suffix = "new"
+
         ctor_id = f"{parent_id}.{ctor_suffix}"
 
         self.emit_symbol(
