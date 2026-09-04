@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 from codegraph_gen.config import LANGUAGE_EXTENSIONS
 
@@ -26,53 +27,78 @@ def discover_files(
     Returns:
         List of tuples: (absolute_file_path, language_name)
     """
-    found_files = []
+    found_files: list[tuple[Path, str]] = []
     workspace = workspace_dir.resolve()
+    workspace_str = str(workspace)
 
     # Map extension -> language
-    ext_to_lang = {}
+    ext_to_lang: dict[str, str] = {}
     for lang in languages:
         if lang in LANGUAGE_EXTENSIONS:
             for ext in LANGUAGE_EXTENSIONS[lang]:
-                ext_to_lang[ext] = lang
+                ext_to_lang[ext.lower()] = lang
 
-    # Normalize exclusions to lowercase for case-insensitive matching
-    exclusions_lower = {exc.lower() for exc in exclusions}
+    name_exclusions: set[str] = set()
+    path_exclusions: set[str] = set()
+    for exc in exclusions:
+        exc_norm = exc.strip("/\\").lower().replace("\\", "/")
+        if "/" in exc_norm:
+            path_exclusions.add(exc_norm)
+        else:
+            name_exclusions.add(exc_norm)
 
-    def is_ignored(path: Path) -> bool:
-        # Check if any part of the path is in exclusions_lower
-        try:
-            rel_parts = path.relative_to(workspace).parts
-        except ValueError:
-            # Not under workspace
-            return True
-
+    def is_path_excluded(rel_parts: tuple[str, ...], rel_str: str) -> bool:
         for part in rel_parts:
-            if part.lower() in exclusions_lower:
+            if part in name_exclusions:
                 return True
+        if path_exclusions:
+            for pe in path_exclusions:
+                if rel_str == pe or rel_str.startswith(pe + "/"):
+                    return True
         return False
 
-    def scan_dir(directory: Path):
+    def scan_dir(dir_path: str, rel_parts: tuple[str, ...]) -> None:
         try:
-            for item in directory.iterdir():
-                if is_ignored(item):
-                    continue
-                if item.is_dir():
-                    scan_dir(item)
-                elif item.is_file():
-                    ext = item.suffix.lower()
-                    if ext in ext_to_lang:
-                        resolved_path = item.resolve()
+            with os.scandir(dir_path) as entries:
+                for entry in entries:
+                    name_lower = entry.name.lower()
+                    if name_lower in name_exclusions:
+                        continue
+                    child_rel_parts = rel_parts + (name_lower,)
+                    child_rel_str = "/".join(child_rel_parts)
+                    if path_exclusions and any(
+                        child_rel_str == pe or child_rel_str.startswith(pe + "/")
+                        for pe in path_exclusions
+                    ):
+                        continue
+
+                    try:
+                        is_d = entry.is_dir()
+                    except OSError:
+                        continue
+
+                    if is_d:
+                        scan_dir(entry.path, child_rel_parts)
+                    else:
                         try:
-                            resolved_path.relative_to(workspace)
-                            found_files.append((resolved_path, ext_to_lang[ext]))
-                        except ValueError:
-                            # Skip symlink target that lies outside workspace
+                            is_f = entry.is_file()
+                        except OSError:
                             continue
+                        if is_f:
+                            dot_idx = name_lower.rfind(".")
+                            if dot_idx != -1:
+                                ext = name_lower[dot_idx:]
+                                if ext in ext_to_lang:
+                                    p = Path(entry.path).resolve()
+                                    try:
+                                        p.relative_to(workspace)
+                                        found_files.append((p, ext_to_lang[ext]))
+                                    except ValueError:
+                                        continue
         except PermissionError:
-            logger.warning(f"Permission denied: {directory}")
+            logger.warning(f"Permission denied: {dir_path}")
         except Exception as e:
-            logger.error(f"Error scanning {directory}: {e}")
+            logger.error(f"Error scanning {dir_path}: {e}")
 
     # Determine which root directories to scan
     if include_dirs:
@@ -86,8 +112,15 @@ def discover_files(
                     f"include_dirs entry is not a directory, skipping: {root}"
                 )
                 continue
-            scan_dir(root)
+            try:
+                init_rel = root.relative_to(workspace)
+                init_parts = tuple(p.lower() for p in init_rel.parts)
+            except ValueError:
+                init_parts = ()
+            if is_path_excluded(init_parts, "/".join(init_parts)):
+                continue
+            scan_dir(str(root), init_parts)
     else:
-        scan_dir(workspace)
+        scan_dir(workspace_str, ())
 
     return found_files

@@ -37,6 +37,7 @@ class DartVisitor(VisitorMixin):
 
     def _parse_import_or_export(self, node: tree_sitter.Node) -> None:
         uri_node = None
+
         def find_uri(n: tree_sitter.Node):
             nonlocal uri_node
             if n.type == "string_literal":
@@ -213,7 +214,9 @@ class DartVisitor(VisitorMixin):
 
     def _visit_constructor(self, node: tree_sitter.Node) -> None:
         parent_id = self.get_current_parent_id()
-        identifiers = [self.get_text(c) for c in node.children if c.type == "identifier"]
+        identifiers = [
+            self.get_text(c) for c in node.children if c.type == "identifier"
+        ]
         if len(identifiers) >= 2:
             ctor_name = f"{identifiers[0]}.{identifiers[1]}"
             ctor_suffix = identifiers[1]
@@ -239,6 +242,7 @@ class DartVisitor(VisitorMixin):
     def _visit_function_or_method(self, node: tree_sitter.Node) -> None:
         name_node = node.child_by_field_name("name")
         if not name_node:
+
             def find_name(n: tree_sitter.Node):
                 if n.type == "identifier":
                     return n
@@ -247,6 +251,7 @@ class DartVisitor(VisitorMixin):
                     if res:
                         return res
                 return None
+
             name_node = find_name(node)
 
         if name_node:
@@ -265,16 +270,23 @@ class DartVisitor(VisitorMixin):
 
             # Extract local variables and parameters inside function body
             func_body_node = None
-            if node.parent and node.parent.type in ("function_body", "method_signature"):
+            if node.parent and node.parent.type in (
+                "function_body",
+                "method_signature",
+            ):
                 func_body_node = node.parent
-            for sibling in (node.parent.children if node.parent else []):
+            for sibling in node.parent.children if node.parent else []:
                 if sibling.type == "function_body":
                     func_body_node = sibling
                     break
 
             if func_body_node:
+
                 def extract_vars(n: tree_sitter.Node):
-                    if n.type in ("local_variable_declaration", "initialized_variable_definition"):
+                    if n.type in (
+                        "local_variable_declaration",
+                        "initialized_variable_definition",
+                    ):
                         var_name = None
                         type_name = None
                         name_child = n.child_by_field_name("name")
@@ -283,7 +295,11 @@ class DartVisitor(VisitorMixin):
                         else:
                             for c in n.children:
                                 if c.type in ("identifier", "initialized_identifier"):
-                                    id_c = c.child_by_field_name("name") if c.type == "initialized_identifier" else c
+                                    id_c = (
+                                        c.child_by_field_name("name")
+                                        if c.type == "initialized_identifier"
+                                        else c
+                                    )
                                     if id_c:
                                         var_name = self.get_text(id_c)
                                         break
@@ -341,10 +357,14 @@ class DartVisitor(VisitorMixin):
             elif child.type == "selector":
                 for sub in child.children:
                     if sub.type in ("unconditional_assignable_selector", "identifier"):
-                        for leaf in (sub.children if sub.children else [sub]):
+                        for leaf in sub.children if sub.children else [sub]:
                             if leaf.type == "identifier":
                                 target = self.get_text(leaf)
-                                if target and target not in ("print", "identical", "assert"):
+                                if target and target not in (
+                                    "print",
+                                    "identical",
+                                    "assert",
+                                ):
                                     self.emit_relation(
                                         parent_id,
                                         target,
@@ -395,7 +415,11 @@ class DartParser(BaseParser):
         doc_lines = []
         prev = node.prev_sibling
         while prev and prev.type in ("comment", "line_comment", "block_comment"):
-            comment_text = source[prev.start_byte : prev.end_byte].decode("utf-8", errors="replace").strip()
+            comment_text = (
+                source[prev.start_byte : prev.end_byte]
+                .decode("utf-8", errors="replace")
+                .strip()
+            )
             if comment_text.startswith("///") or comment_text.startswith("/**"):
                 doc_lines.insert(0, comment_text)
             prev = prev.prev_sibling

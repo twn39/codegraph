@@ -25,8 +25,26 @@ def test_visitors_use_mixin():
 
 def test_node_signature_changes_with_edges():
     G = nx.DiGraph()
-    G.add_node("a", label="a", type="function", source_file="a.py", line_start=1, line_end=1, signature="", docstring="")
-    G.add_node("b", label="b", type="function", source_file="a.py", line_start=2, line_end=2, signature="", docstring="")
+    G.add_node(
+        "a",
+        label="a",
+        type="function",
+        source_file="a.py",
+        line_start=1,
+        line_end=1,
+        signature="",
+        docstring="",
+    )
+    G.add_node(
+        "b",
+        label="b",
+        type="function",
+        source_file="a.py",
+        line_start=2,
+        line_end=2,
+        signature="",
+        docstring="",
+    )
     s1 = node_neighborhood_signature(G, "a", "comp")
     G.add_edge("a", "b", relation="calls")
     s2 = node_neighborhood_signature(G, "a", "comp")

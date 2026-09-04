@@ -7,7 +7,9 @@ def test_dart_strategy_import_candidates():
     strategy = DartStrategy()
 
     # package: import URI
-    candidates = strategy.get_import_path_candidates("package:my_app/services/auth.dart")
+    candidates = strategy.get_import_path_candidates(
+        "package:my_app/services/auth.dart"
+    )
     assert "lib/services/auth.dart" in candidates
 
     # relative import

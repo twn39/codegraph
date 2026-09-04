@@ -47,6 +47,8 @@ class PipelineContext:
     prompt_content: str = ""
 
 
-def notify(ctx: PipelineContext, stage: Any, item: Any = None, idx: int = 0, total: int = 0) -> None:
+def notify(
+    ctx: PipelineContext, stage: Any, item: Any = None, idx: int = 0, total: int = 0
+) -> None:
     if ctx.progress_callback:
         ctx.progress_callback(stage, item, idx, total)

@@ -261,7 +261,9 @@ def test_language_golden_key_call_edges(
         if d.get("relation") == "calls"
     }
     missing = expected_call_labels - call_targets
-    assert not missing, f"{lang}: missing resolved call targets {missing}, got {call_targets}"
+    assert not missing, (
+        f"{lang}: missing resolved call targets {missing}, got {call_targets}"
+    )
 
 
 def test_python_decorated_definition(tmp_path: Path):

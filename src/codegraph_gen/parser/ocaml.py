@@ -201,7 +201,9 @@ class OCamlVisitor(VisitorMixin):
 
         if module_path:
             module_name = self.get_text(module_path)
-            self.emit_relation(self.file_node_id, module_name, "imports", import_map={"*": "*"})
+            self.emit_relation(
+                self.file_node_id, module_name, "imports", import_map={"*": "*"}
+            )
         self.generic_visit(node)
 
     def visit_include_module(self, node: tree_sitter.Node) -> None:
@@ -213,7 +215,9 @@ class OCamlVisitor(VisitorMixin):
 
         if module_path:
             module_name = self.get_text(module_path)
-            self.emit_relation(self.file_node_id, module_name, "imports", import_map={"*": "*"})
+            self.emit_relation(
+                self.file_node_id, module_name, "imports", import_map={"*": "*"}
+            )
         self.generic_visit(node)
 
     def visit_application_expression(self, node: tree_sitter.Node) -> None:

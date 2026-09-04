@@ -164,6 +164,7 @@ def _lookup_class_id(
     node_ids,
     graph_nodes,
     strategy,
+    class_like_symbols=None,
 ) -> str | None:
     """Resolve a type name / node id to a class-like graph node id."""
     candidates = [receiver_type, _normalize_type_name(receiver_type)]
@@ -185,27 +186,28 @@ def _lookup_class_id(
             if class_id in node_ids:
                 return class_id
 
-    if strategy.has_package_sibling_scope():
-        caller_dir = Path(source_file).parent
-        for cand in candidates:
-            for nid in node_ids:
-                ndata = graph_nodes[nid]
-                if (
-                    ndata.get("type") in ("class", "struct", "interface", "enum")
-                    and ndata.get("label") == cand
-                ):
-                    node_file = ndata.get("source_file", "")
-                    if node_file and Path(node_file).parent == caller_dir:
-                        return nid
-
+    caller_dir = Path(source_file).parent
     for cand in candidates:
-        for nid in node_ids:
-            ndata = graph_nodes[nid]
-            if (
-                ndata.get("type") in ("class", "struct", "interface", "enum")
-                and ndata.get("label") == cand
-            ):
-                return nid
+        if class_like_symbols is not None and cand in class_like_symbols:
+            matched_nids = class_like_symbols[cand]
+        else:
+            matched_nids = [
+                nid
+                for nid in node_ids
+                if graph_nodes[nid].get("type")
+                in ("class", "struct", "interface", "enum")
+                and graph_nodes[nid].get("label") == cand
+            ]
+
+        if strategy.has_package_sibling_scope():
+            for nid in matched_nids:
+                node_file = graph_nodes[nid].get("source_file", "")
+                if node_file and Path(node_file).parent == caller_dir:
+                    return nid
+
+        if matched_nids:
+            return matched_nids[0]
+
     return None
 
 
@@ -217,6 +219,8 @@ def _find_method_on_class(
     node_ids,
     graph_nodes,
     receiver_type: str,
+    global_symbol_map=None,
+    methods_by_class=None,
 ) -> str | None:
     """Locate a method/function node belonging to *resolved_class_id*."""
     for candidate in (
@@ -226,11 +230,24 @@ def _find_method_on_class(
         if candidate in node_ids:
             return candidate
 
+    if methods_by_class and resolved_class_id in methods_by_class:
+        method_id = methods_by_class[resolved_class_id].get(method_name)
+        if method_id:
+            return method_id
+
     class_label = graph_nodes[resolved_class_id].get("label", "")
     type_norm = _normalize_type_name(receiver_type)
     short_type = type_norm.rsplit(".", 1)[-1]
 
-    for nid in node_ids:
+    # Search candidates matching method_name from global_symbol_map (O(1) label index),
+    # avoiding O(N) full graph scans!
+    candidate_nids = (
+        global_symbol_map.get(method_name, ())
+        if global_symbol_map is not None
+        else node_ids
+    )
+
+    for nid in candidate_nids:
         ndata = graph_nodes[nid]
         if ndata.get("type") not in ("method", "function"):
             continue
@@ -280,6 +297,7 @@ def _transfer_return_type(
         node_ids=ctx.node_ids,
         graph_nodes=ctx.graph_nodes,
         strategy=ctx.strategy,
+        class_like_symbols=getattr(ctx, "class_like_symbols", None),
     )
 
 
@@ -295,6 +313,7 @@ def _resolve_local_binding_impl(ctx: ResolutionContext) -> str | None:
         node_ids=ctx.node_ids,
         graph_nodes=ctx.graph_nodes,
         strategy=ctx.strategy,
+        class_like_symbols=getattr(ctx, "class_like_symbols", None),
     )
     if not resolved_class_id:
         return None
@@ -318,6 +337,8 @@ def _resolve_local_binding_impl(ctx: ResolutionContext) -> str | None:
             node_ids=ctx.node_ids,
             graph_nodes=ctx.graph_nodes,
             receiver_type=current_receiver_type,
+            global_symbol_map=getattr(ctx, "global_symbol_map", None),
+            methods_by_class=getattr(ctx, "methods_by_class", None),
         )
         if not method_id:
             return last_method_id if index == 0 else None
@@ -443,19 +464,35 @@ def resolve_package_siblings(ctx: ResolutionContext) -> str | _StopResolution | 
     node_ids = ctx.node_ids
     graph_nodes = ctx.graph_nodes
 
-    caller_dir = Path(source_file).parent
-    for nid in node_ids:
-        ndata = graph_nodes[nid]
-        if ndata.get("type") == "file":
-            continue
-        node_file = ndata.get("source_file", "")
-        if node_file and Path(node_file).parent == caller_dir:
-            if nid.endswith(f"::{main_symbol}"):
+    caller_dir = str(Path(source_file).parent)
+    candidate_nids = (
+        ctx.dir_to_symbols.get(caller_dir, ())
+        if getattr(ctx, "dir_to_symbols", None)
+        else None
+    )
+    if candidate_nids is not None:
+        target_suffix = f"::{main_symbol}"
+        for nid in candidate_nids:
+            if nid.endswith(target_suffix):
                 if rest_of_callee:
                     sub_target = f"{nid}.{rest_of_callee}"
                     if sub_target in node_ids:
                         return sub_target
                 return nid
+    else:
+        caller_dir_path = Path(source_file).parent
+        for nid in node_ids:
+            ndata = graph_nodes[nid]
+            if ndata.get("type") == "file":
+                continue
+            node_file = ndata.get("source_file", "")
+            if node_file and Path(node_file).parent == caller_dir_path:
+                if nid.endswith(f"::{main_symbol}"):
+                    if rest_of_callee:
+                        sub_target = f"{nid}.{rest_of_callee}"
+                        if sub_target in node_ids:
+                            return sub_target
+                    return nid
     return None
 
 
@@ -488,11 +525,22 @@ def resolve_explicit_imports(ctx: ResolutionContext) -> str | _StopResolution | 
             target_candidate = f"{target_file_id}::{rest_of_callee}"
             if target_candidate in node_ids:
                 return target_candidate
-            for nid in node_ids:
-                if graph_nodes[nid].get(
-                    "source_file"
-                ) == target_file_id and nid.endswith(f".{parts[-1]}"):
-                    return nid
+            file_candidates = (
+                ctx.file_to_nodes.get(target_file_id, ())
+                if getattr(ctx, "file_to_nodes", None)
+                else None
+            )
+            if file_candidates is not None:
+                leaf_suffix = f".{parts[-1]}"
+                for nid in file_candidates:
+                    if nid.endswith(leaf_suffix):
+                        return nid
+            else:
+                for nid in node_ids:
+                    if graph_nodes[nid].get(
+                        "source_file"
+                    ) == target_file_id and nid.endswith(f".{parts[-1]}"):
+                        return nid
         else:
             target_candidate = f"{target_file_id}::{main_symbol}"
             if target_candidate in node_ids:

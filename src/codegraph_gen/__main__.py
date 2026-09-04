@@ -257,9 +257,7 @@ def build(
         min_internal_resolve_rate
         if min_internal_resolve_rate is not None
         else (
-            project_cfg.min_internal_resolve_rate
-            if project_cfg is not None
-            else None
+            project_cfg.min_internal_resolve_rate if project_cfg is not None else None
         )
     )
     effective_max_internal_unresolved = (
@@ -422,9 +420,7 @@ def build(
             short = err if len(err) <= 160 else err[:157] + "..."
             console.print(f"      [dim]- {short}[/dim]")
         if len(result.parse_errors) > 5:
-            console.print(
-                f"      [dim]… and {len(result.parse_errors) - 5} more[/dim]"
-            )
+            console.print(f"      [dim]… and {len(result.parse_errors) - 5} more[/dim]")
 
     if G.graph.get("pipeline_reused_snapshot"):
         console.print(

@@ -80,7 +80,9 @@ class KotlinVisitor(VisitorMixin):
                                 )
                                 if id_node:
                                     parent_name = self.get_text(id_node)
-                                    self.emit_relation(class_id, parent_name, "inherits")
+                                    self.emit_relation(
+                                        class_id, parent_name, "inherits"
+                                    )
 
             with self.scope.push(class_id, sym_type):
                 self.generic_visit(node)
@@ -218,7 +220,9 @@ class KotlinVisitor(VisitorMixin):
                 last_part = target.split(".")[-1]
                 import_map = {last_part: last_part}
 
-            self.emit_relation(self.file_node_id, target, "imports", import_map=import_map)
+            self.emit_relation(
+                self.file_node_id, target, "imports", import_map=import_map
+            )
         self.generic_visit(node)
 
     def visit_call_expression(self, node: tree_sitter.Node) -> None:

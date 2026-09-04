@@ -35,9 +35,7 @@ def _stable_hash(payload: Any) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
-def node_neighborhood_signature(
-    G: nx.DiGraph, nid: str, component_name: str
-) -> str:
+def node_neighborhood_signature(G: nx.DiGraph, nid: str, component_name: str) -> str:
     """Hash node attributes + incident edges + component label."""
     data = G.nodes[nid]
     attrs = {
@@ -51,12 +49,10 @@ def node_neighborhood_signature(
         "component": component_name,
     }
     outs = sorted(
-        (str(v), str(d.get("relation", "")))
-        for _, v, d in G.out_edges(nid, data=True)
+        (str(v), str(d.get("relation", ""))) for _, v, d in G.out_edges(nid, data=True)
     )
     ins = sorted(
-        (str(u), str(d.get("relation", "")))
-        for u, _, d in G.in_edges(nid, data=True)
+        (str(u), str(d.get("relation", ""))) for u, _, d in G.in_edges(nid, data=True)
     )
     return _stable_hash({"attrs": attrs, "out": outs, "in": ins})
 
@@ -124,9 +120,7 @@ def files_touching_node(G: nx.DiGraph, nid: str) -> set[str]:
     return out
 
 
-def should_force_render_node(
-    G: nx.DiGraph, nid: str, force_files: set[str]
-) -> bool:
+def should_force_render_node(G: nx.DiGraph, nid: str, force_files: set[str]) -> bool:
     if not force_files:
         return False
     return bool(files_touching_node(G, nid) & force_files)
@@ -221,7 +215,9 @@ def save_pipeline_snapshot(
     logger.info("Wrote pipeline snapshot → %s", path)
 
 
-def load_pipeline_snapshot(path: Path, expected_fingerprint: str) -> PipelineSnapshot | None:
+def load_pipeline_snapshot(
+    path: Path, expected_fingerprint: str
+) -> PipelineSnapshot | None:
     """Load snapshot when fingerprint matches; otherwise return None."""
     if not path.is_file():
         return None
@@ -245,9 +241,7 @@ def load_pipeline_snapshot(path: Path, expected_fingerprint: str) -> PipelineSna
         if isinstance(res_raw, dict):
             G.graph["resolution_stats"] = ResolutionStats.model_validate(res_raw)
 
-        components = {
-            int(k): list(v) for k, v in payload.get("components", {}).items()
-        }
+        components = {int(k): list(v) for k, v in payload.get("components", {}).items()}
         cohesion_scores = {
             int(k): float(v) for k, v in payload.get("cohesion_scores", {}).items()
         }

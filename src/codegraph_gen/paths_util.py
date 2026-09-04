@@ -49,4 +49,6 @@ def is_test_path(path: str) -> bool:
     lower = name.lower()
     if lower.startswith("test_") or lower.startswith("test-"):
         return True
-    return any(name.endswith(suf) or lower.endswith(suf.lower()) for suf in _TEST_FILE_SUFFIXES)
+    return any(
+        name.endswith(suf) or lower.endswith(suf.lower()) for suf in _TEST_FILE_SUFFIXES
+    )

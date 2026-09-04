@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import networkx as nx
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 from codegraph_gen.analyzer import AnalysisResult, ResolutionStats, analyze_graph
 from codegraph_gen.builder import build_graph
@@ -39,6 +39,19 @@ from codegraph_gen.writer import VaultWriter
 
 logger = logging.getLogger(__name__)
 
+_CACHE_ADAPTER: TypeAdapter[dict[str, CacheEntry]] = TypeAdapter(dict[str, CacheEntry])
+_WORKER_PARSER_CACHE: dict[str, Any] = {}
+
+
+def _get_worker_parser(lang: str) -> Any:
+    parser = _WORKER_PARSER_CACHE.get(lang)
+    if parser is None:
+        from codegraph_gen.parser import get_parser as _get_parser
+
+        parser = _get_parser(lang)
+        _WORKER_PARSER_CACHE[lang] = parser
+    return parser
+
 
 def get_file_hash(path: Path) -> str:
     """Computes MD5 hash of a file."""
@@ -57,9 +70,7 @@ def _parse_file_worker(
 ) -> tuple[Path, Optional[ExtractionResult], Optional[str]]:
     """Worker function for parallel file parsing."""
     try:
-        from codegraph_gen.parser import get_parser as _get_parser
-
-        parser = _get_parser(lang)
+        parser = _get_worker_parser(lang)
         result = parser.parse_file(file_path, workspace_dir)
         return file_path, result, None
     except Exception as e:
@@ -67,6 +78,31 @@ def _parse_file_worker(
 
         err_msg = f"{e}\n{traceback.format_exc()}"
         return file_path, None, err_msg
+
+
+def _parse_chunk_worker(
+    chunk: list[tuple[Path, str, str, float, int, str, int]],
+    workspace_dir: Path,
+) -> list[
+    tuple[Path, str, float, int, str, int, Optional[ExtractionResult], Optional[str]]
+]:
+    """Worker function for chunked parallel file parsing."""
+    results = []
+    for file_path, lang, rel_path, mtime, size, file_hash, mtime_ns in chunk:
+        try:
+            parser = _get_worker_parser(lang)
+            res = parser.parse_file(file_path, workspace_dir)
+            results.append(
+                (file_path, rel_path, mtime, size, file_hash, mtime_ns, res, None)
+            )
+        except Exception as e:
+            import traceback
+
+            err_msg = f"{e}\n{traceback.format_exc()}"
+            results.append(
+                (file_path, rel_path, mtime, size, file_hash, mtime_ns, None, err_msg)
+            )
+    return results
 
 
 class PipelineStage(str, Enum):
@@ -137,16 +173,12 @@ class CodegraphEngine:
             ctx.dirty_files,
             ctx.cache_entries,
             ctx.parse_errors,
-        ) = self._parse_with_cache(
-            config, ctx.files, ctx.cache_path, progress_callback
-        )
+        ) = self._parse_with_cache(config, ctx.files, ctx.cache_path, progress_callback)
         self._enforce_parse_errors(config, ctx.parse_errors)
 
         # Fingerprint of the workspace content + clustering knobs
         file_hashes = {
-            rel: entry.hash
-            for rel, entry in ctx.cache_entries.items()
-            if entry.hash
+            rel: entry.hash for rel, entry in ctx.cache_entries.items() if entry.hash
         }
         include_names = (
             [str(p.relative_to(config.workspace_dir)) for p in config.include_dirs]
@@ -215,6 +247,8 @@ class CodegraphEngine:
             ctx.rendered_nodes,
             ctx.rendered_components,
             ctx.new_signatures,
+            skipped_nodes,
+            skipped_components,
         ) = self._render_incremental(
             config,
             renderer,
@@ -252,6 +286,8 @@ class CodegraphEngine:
             ctx.rendered_components,
             ctx.readme_content,
             ctx.prompt_content,
+            skipped_nodes=skipped_nodes,
+            skipped_components=skipped_components,
         )
         ctx.graph.graph["vault_write_stats"] = {
             "written": write_stats.written,
@@ -311,13 +347,22 @@ class CodegraphEngine:
         if not cache_path.exists():
             return cache_entries
         try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cache_data = json.load(f)
-                for k, v in cache_data.items():
-                    cache_entries[k] = CacheEntry(**v)
-            logger.info(f"Loaded {len(cache_entries)} cache entries.")
+            raw_bytes = cache_path.read_bytes()
+            if raw_bytes:
+                cache_entries = _CACHE_ADAPTER.validate_json(raw_bytes)
+                logger.info(f"Loaded {len(cache_entries)} cache entries.")
         except Exception as e:
-            logger.warning(f"Could not load cache: {e}")
+            logger.warning(
+                f"Could not load cache with fast adapter, trying fallback: {e}"
+            )
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+                    for k, v in cache_data.items():
+                        cache_entries[k] = CacheEntry(**v)
+                logger.info(f"Loaded {len(cache_entries)} cache entries via fallback.")
+            except Exception as e2:
+                logger.warning(f"Could not load cache: {e2}")
         return cache_entries
 
     def _parse_with_cache(
@@ -332,11 +377,9 @@ class CodegraphEngine:
         Returns extractions, dirty file set, updated cache map, and parse error messages.
         """
         total_files = len(files)
-        cache_entries = (
-            self._load_cache_entries(cache_path) if config.use_cache else {}
-        )
+        cache_entries = self._load_cache_entries(cache_path) if config.use_cache else {}
         extractions: list[ExtractionResult] = []
-        files_to_parse: list[tuple[Path, str, str, float, int, str]] = []
+        files_to_parse: list[tuple[Path, str, str, float, int, str, int]] = []
         new_cache_entries: dict[str, CacheEntry] = {}
         dirty_files: set[str] = set()
         parse_errors: list[str] = []
@@ -347,27 +390,32 @@ class CodegraphEngine:
                 stat = file_path.stat()
                 mtime = stat.st_mtime
                 size = stat.st_size
-                file_hash = get_file_hash(file_path)
+                mtime_ns = getattr(stat, "st_mtime_ns", int(mtime * 1e9))
 
                 if rel_path in cache_entries:
                     entry = cache_entries[rel_path]
-                    if (
-                        entry.mtime == mtime
-                        and entry.size == size
-                        and entry.hash == file_hash
-                    ):
+                    mtime_matches = (
+                        (entry.mtime_ns == mtime_ns)
+                        if (entry.mtime_ns is not None)
+                        else (entry.mtime == mtime)
+                    )
+                    if mtime_matches and entry.size == size:
                         extractions.append(entry.result)
+                        if entry.mtime_ns is None:
+                            entry.mtime_ns = mtime_ns
                         new_cache_entries[rel_path] = entry
                         continue
 
+                # File is dirty or cache miss: compute hash only when needed!
+                file_hash = get_file_hash(file_path)
                 dirty_files.add(rel_path)
                 files_to_parse.append(
-                    (file_path, lang, rel_path, mtime, size, file_hash)
+                    (file_path, lang, rel_path, mtime, size, file_hash, mtime_ns)
                 )
             except Exception as e:
                 logger.error(f"Error accessing file metadata for {file_path}: {e}")
                 dirty_files.add(rel_path)
-                files_to_parse.append((file_path, lang, rel_path, 0.0, 0, ""))
+                files_to_parse.append((file_path, lang, rel_path, 0.0, 0, "", 0))
 
         removed_files = set(cache_entries.keys()) - {
             str(fp.relative_to(config.workspace_dir)) for fp, _ in files
@@ -388,9 +436,7 @@ class CodegraphEngine:
 
         if not files_to_parse:
             if progress_callback:
-                progress_callback(
-                    PipelineStage.PARSING, None, total_files, total_files
-                )
+                progress_callback(PipelineStage.PARSING, None, total_files, total_files)
             return extractions, dirty_files, new_cache_entries, parse_errors
 
         max_workers = config.max_workers
@@ -399,33 +445,47 @@ class CodegraphEngine:
                 f"Parsing {len(files_to_parse)} files in parallel with "
                 f"{max_workers} workers..."
             )
+            # Dynamic chunksize: minimize IPC roundtrips while keeping multi-core load balanced
+            chunksize = max(1, min(64, len(files_to_parse) // (max_workers * 4)))
+            chunks = [
+                files_to_parse[i : i + chunksize]
+                for i in range(0, len(files_to_parse), chunksize)
+            ]
+
+            processed_count = 0
             with concurrent.futures.ProcessPoolExecutor(
                 max_workers=max_workers
             ) as executor:
                 futures = {
                     executor.submit(
-                        _parse_file_worker,
-                        file_path,
-                        lang,
+                        _parse_chunk_worker,
+                        chunk,
                         config.workspace_dir,
-                    ): (file_path, rel_path, mtime, size, file_hash)
-                    for file_path, lang, rel_path, mtime, size, file_hash in files_to_parse
+                    ): chunk
+                    for chunk in chunks
                 }
 
-                for idx, future in enumerate(
-                    concurrent.futures.as_completed(futures), start=1
-                ):
-                    file_path, rel_path, mtime, size, file_hash = futures[future]
-                    progress_idx = num_hits + idx
-                    if progress_callback:
-                        progress_callback(
-                            PipelineStage.PARSING,
-                            file_path,
-                            progress_idx,
-                            total_files,
-                        )
-                    try:
-                        _, result, err_msg = future.result()
+                for future in concurrent.futures.as_completed(futures):
+                    chunk_results = future.result()
+                    for (
+                        file_path,
+                        rel_path,
+                        mtime,
+                        size,
+                        file_hash,
+                        mtime_ns,
+                        result,
+                        err_msg,
+                    ) in chunk_results:
+                        processed_count += 1
+                        progress_idx = num_hits + processed_count
+                        if progress_callback:
+                            progress_callback(
+                                PipelineStage.PARSING,
+                                file_path,
+                                progress_idx,
+                                total_files,
+                            )
                         if err_msg:
                             msg = f"{rel_path}: {err_msg}"
                             parse_errors.append(msg)
@@ -440,11 +500,8 @@ class CodegraphEngine:
                                     size=size,
                                     hash=file_hash,
                                     result=result,
+                                    mtime_ns=mtime_ns,
                                 )
-                    except Exception as e:
-                        msg = f"{rel_path}: {e}"
-                        parse_errors.append(msg)
-                        logger.error(f"Failed to parse file {file_path}: {e}")
         else:
             logger.info(f"Parsing {len(files_to_parse)} files sequentially...")
             for idx, (
@@ -454,6 +511,7 @@ class CodegraphEngine:
                 mtime,
                 size,
                 file_hash,
+                mtime_ns,
             ) in enumerate(files_to_parse, start=1):
                 progress_idx = num_hits + idx
                 if progress_callback:
@@ -466,7 +524,11 @@ class CodegraphEngine:
                     extractions.append(result)
                     if file_hash:
                         new_cache_entries[rel_path] = CacheEntry(
-                            mtime=mtime, size=size, hash=file_hash, result=result
+                            mtime=mtime,
+                            size=size,
+                            hash=file_hash,
+                            result=result,
+                            mtime_ns=mtime_ns,
                         )
                 except Exception as e:
                     msg = f"{rel_path}: {e}"
@@ -551,7 +613,7 @@ class CodegraphEngine:
         component_names: dict[int, str],
         analysis: AnalysisResult,
         dirty_files: set[str],
-    ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str], set[str], set[str]]:
         """Render node/component pages with signature-based skip when cache on."""
         node_component_map: dict[str, str] = {}
         for cid, members in components.items():
@@ -571,6 +633,7 @@ class CodegraphEngine:
         comps_dir = config.absolute_output_dir / "components"
 
         rendered_nodes: dict[str, str] = {}
+        skipped_nodes: set[str] = set()
         nodes_reused = 0
         nodes_rendered = 0
         for nid, ndata in G.nodes(data=True):
@@ -586,17 +649,15 @@ class CodegraphEngine:
                 and not should_force_render_node(G, nid, force_files)
             )
             if can_reuse:
-                try:
-                    rendered_nodes[fname] = disk_path.read_text(encoding="utf-8")
-                    nodes_reused += 1
-                    continue
-                except Exception:
-                    pass
+                skipped_nodes.add(fname)
+                nodes_reused += 1
+                continue
             content = renderer.render_node_page(nid, ndata, G, node_component_map)
             rendered_nodes[fname] = content
             nodes_rendered += 1
 
         rendered_components: dict[str, str] = {}
+        skipped_components: set[str] = set()
         comps_reused = 0
         comps_rendered = 0
         for cid, members in components.items():
@@ -617,12 +678,9 @@ class CodegraphEngine:
                 and not member_forced
             )
             if can_reuse:
-                try:
-                    rendered_components[fname] = disk_path.read_text(encoding="utf-8")
-                    comps_reused += 1
-                    continue
-                except Exception:
-                    pass
+                skipped_components.add(fname)
+                comps_reused += 1
+                continue
             content = renderer.render_component_page(
                 cid,
                 members,
@@ -652,7 +710,13 @@ class CodegraphEngine:
         }
         # Stash sig path key for save step
         G.graph["_signature_store_path"] = str(sig_path)
-        return rendered_nodes, rendered_components, new_sigs
+        return (
+            rendered_nodes,
+            rendered_components,
+            new_sigs,
+            skipped_nodes,
+            skipped_components,
+        )
 
     @staticmethod
     def _load_preserved_ai_insights(output_dir: Path) -> str | None:
@@ -718,12 +782,7 @@ class CodegraphEngine:
             return
         try:
             config.absolute_output_dir.mkdir(parents=True, exist_ok=True)
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {k: v.model_dump() for k, v in new_cache_entries.items()},
-                    f,
-                    indent=2,
-                )
+            cache_path.write_bytes(_CACHE_ADAPTER.dump_json(new_cache_entries))
             logger.info(f"Saved {len(new_cache_entries)} cache entries.")
             sig_path = config.absolute_output_dir / SIGNATURE_STORE_NAME
             save_signature_store(sig_path, new_sigs)

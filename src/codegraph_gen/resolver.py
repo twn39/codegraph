@@ -72,9 +72,17 @@ class WorklistFixpointSolver:
             self.in_queue.add(key)
 
     def solve(self) -> None:
+        iteration_counts: dict[tuple[str, str], int] = {}
+        max_iterations_per_var = 10
         while self.queue_list:
             nid, var_name = self.queue_list.popleft()
             self.in_queue.remove((nid, var_name))
+
+            key = (nid, var_name)
+            count = iteration_counts.get(key, 0)
+            if count >= max_iterations_per_var:
+                continue
+            iteration_counts[key] = count + 1
 
             ndata = self.resolver.G.nodes[nid]
             local_bindings = ndata.get("local_bindings", {})
@@ -191,6 +199,7 @@ class TypeResolver:
         self.extractions = extractions
         self.workspace_dir = workspace_dir
         self.node_ids = set(G.nodes)
+        self.node_ids_frozen = frozenset(self.node_ids)
 
         self.scopes: dict[str, FileSymbolScope] = {}
         self.file_languages: dict[str, str] = {}
@@ -198,7 +207,29 @@ class TypeResolver:
         self.global_symbol_map: dict[str, list[str]] = {}
         self.return_types: dict[str, str] = {}
 
+        # Fast lookup indices to eliminate O(N) full graph scans
+        self.file_nodes_by_name: dict[str, list[str]] = {}
+        self.file_nodes_normalized: dict[str, str] = {}
+        self.class_like_symbols: dict[str, list[str]] = {}
+        self.methods_by_class: dict[str, dict[str, str]] = {}
+        self.dir_to_symbols: dict[str, list[str]] = {}
+        self.file_to_nodes: dict[str, list[str]] = {}
+
         self._initialize_scopes()
+
+        # Cache immutable proxies once to avoid per-edge re-allocations
+        self.global_symbol_map_proxy = MappingProxyType(self.global_symbol_map)
+        self.return_types_proxy = MappingProxyType(self.return_types)
+        self.class_like_symbols_proxy = MappingProxyType(self.class_like_symbols)
+        self.methods_by_class_proxy = MappingProxyType(
+            {k: MappingProxyType(v) for k, v in self.methods_by_class.items()}
+        )
+        self.dir_to_symbols_proxy = MappingProxyType(
+            {k: tuple(v) for k, v in self.dir_to_symbols.items()}
+        )
+        self.file_to_nodes_proxy = MappingProxyType(
+            {k: tuple(v) for k, v in self.file_to_nodes.items()}
+        )
 
     def _initialize_scopes(self) -> None:
         # Detect languages and load strategies
@@ -209,24 +240,47 @@ class TypeResolver:
                 self.file_languages[nid] = strategy.name
                 self.scopes[nid] = FileSymbolScope(nid, strategy.name)
 
-        # Populate declared, global symbols and return types
+        # Populate declared, global symbols, return types and lookup indices
         for nid, data in self.G.nodes(data=True):
             sf = data.get("source_file")
             ntype = data.get("type")
             label = data.get("label")
 
-            if label and ntype != "file":
-                self.global_symbol_map.setdefault(label, []).append(nid)
+            if ntype == "file":
+                fname = Path(nid).name
+                self.file_nodes_by_name.setdefault(fname, []).append(nid)
+                norm_nid = nid.replace("\\", "/")
+                self.file_nodes_normalized[norm_nid] = nid
+            else:
+                if sf:
+                    self.file_to_nodes.setdefault(sf, []).append(nid)
+                    dir_str = str(Path(sf).parent)
+                    self.dir_to_symbols.setdefault(dir_str, []).append(nid)
 
-            if sf and ntype != "file" and label and sf in self.scopes:
-                self.scopes[sf].declared_symbols[label] = nid
+                if label:
+                    self.global_symbol_map.setdefault(label, []).append(nid)
+                    if ntype in ("class", "struct", "interface", "enum"):
+                        self.class_like_symbols.setdefault(label, []).append(nid)
 
-            if ntype in ("function", "method") and sf:
-                strategy = self.file_strategies.get(sf, get_strategy_for_file(sf))
-                sig = data.get("signature", "")
-                ret = strategy.extract_return_type(sig)
-                if ret:
-                    self.return_types[nid] = ret
+                if sf and label and sf in self.scopes:
+                    self.scopes[sf].declared_symbols[label] = nid
+
+                if ntype in ("function", "method"):
+                    if "." in nid:
+                        parent_class = nid.rsplit(".", 1)[0]
+                        if label:
+                            self.methods_by_class.setdefault(parent_class, {})[
+                                label
+                            ] = nid
+
+                    if sf:
+                        strategy = self.file_strategies.get(
+                            sf, get_strategy_for_file(sf)
+                        )
+                        sig = data.get("signature", "")
+                        ret = strategy.extract_return_type(sig)
+                        if ret:
+                            self.return_types[nid] = ret
 
         # Populate imports
         for ext in self.extractions:
@@ -290,10 +344,9 @@ class TypeResolver:
                 pass
 
             target_name = Path(target).name
-            for nid in self.node_ids:
-                if self.G.nodes[nid]["type"] == "file":
-                    if Path(nid).name == target_name:
-                        return nid
+            hits = self.file_nodes_by_name.get(target_name)
+            if hits:
+                return hits[0]
             return None
 
         # Non-path targets (e.g. dot/colon namespaces or package imports)
@@ -303,15 +356,14 @@ class TypeResolver:
                 return cand
 
             cand_normalized = cand.replace("\\", "/")
-            for nid in self.node_ids:
-                if self.G.nodes[nid]["type"] == "file":
-                    nid_normalized = nid.replace("\\", "/")
-                    if (
-                        nid_normalized == cand_normalized
-                        or nid_normalized.endswith("/" + cand_normalized)
-                        or nid_normalized.endswith("\\" + cand_normalized)
-                    ):
-                        return nid
+            if cand_normalized in self.file_nodes_normalized:
+                return self.file_nodes_normalized[cand_normalized]
+
+            suffix_slash = "/" + cand_normalized
+            suffix_bslash = "\\" + cand_normalized
+            for norm_nid, orig_nid in self.file_nodes_normalized.items():
+                if norm_nid.endswith(suffix_slash) or norm_nid.endswith(suffix_bslash):
+                    return orig_nid
 
         return None
 
@@ -358,10 +410,14 @@ class TypeResolver:
             strategy=strategy,
             scope=scope,
             local_bindings=MappingProxyType(caller_data.get("local_bindings", {})),
-            node_ids=frozenset(self.node_ids),
+            node_ids=self.node_ids_frozen,
             graph_nodes=self.G.nodes,
-            global_symbol_map=MappingProxyType(self.global_symbol_map),
-            return_types=MappingProxyType(self.return_types),
+            global_symbol_map=self.global_symbol_map_proxy,
+            return_types=self.return_types_proxy,
+            class_like_symbols=self.class_like_symbols_proxy,
+            methods_by_class=self.methods_by_class_proxy,
+            dir_to_symbols=self.dir_to_symbols_proxy,
+            file_to_nodes=self.file_to_nodes_proxy,
         )
 
         resolver_chain = (
@@ -455,9 +511,7 @@ class TypeResolver:
                     _bump(rel, "resolved")
                     _bump_category(category, "resolved")
                     if rel == "imports":
-                        self.G.add_edge(
-                            src, resolved_tgt, relation=rel, raw_target=tgt
-                        )
+                        self.G.add_edge(src, resolved_tgt, relation=rel, raw_target=tgt)
                     else:
                         self.G.add_edge(src, resolved_tgt, relation=rel)
                 else:
@@ -465,10 +519,7 @@ class TypeResolver:
                     _bump(rel, "unresolved")
                     _bump_category(category, "unresolved")
                     cat_count = samples_per_category.get(category, 0)
-                    if (
-                        len(stats.unresolved_samples) < max_samples
-                        and cat_count < 12
-                    ):
+                    if len(stats.unresolved_samples) < max_samples and cat_count < 12:
                         stats.unresolved_samples.append(
                             {
                                 "source": src,

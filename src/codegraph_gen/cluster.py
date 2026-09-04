@@ -20,9 +20,7 @@ def _node_is_test(G: nx.DiGraph, nid: str) -> bool:
     return False
 
 
-def _prefer_production_central(
-    G: nx.DiGraph, members: list[str]
-) -> str:
+def _prefer_production_central(G: nx.DiGraph, members: list[str]) -> str:
     """Pick naming hub preferring non-test, non-file symbols with high degree."""
     degrees = dict(G.degree(members))
 
@@ -152,7 +150,7 @@ def detect_components(
         else:
             U.add_edge(u, v, weight=weight)
 
-    communities = list(louvain_communities(U, weight="weight", seed=42))
+    communities = list(louvain_communities(U, weight="weight", threshold=1e-4, seed=42))
     communities.sort(key=lambda s: (-len(s), sorted(list(s))))
 
     components: dict[int, list[str]] = {}

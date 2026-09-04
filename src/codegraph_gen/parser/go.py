@@ -118,7 +118,9 @@ class GoVisitor(VisitorMixin):
             else:
                 import_map[pkg_name] = pkg_name
 
-            self.emit_relation(self.file_node_id, import_path, "imports", import_map=import_map)
+            self.emit_relation(
+                self.file_node_id, import_path, "imports", import_map=import_map
+            )
         self.generic_visit(node)
 
     def visit_call_expression(self, node: tree_sitter.Node) -> None:

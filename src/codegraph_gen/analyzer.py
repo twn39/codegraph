@@ -151,10 +151,17 @@ def find_call_cycles(G: nx.DiGraph, max_cycles: int = 20) -> list[list[str]]:
 
     try:
         cycles: list[list[str]] = []
-        for cycle in nx.simple_cycles(H):
-            # Only multi-node mutual cycles (length >= 2)
-            if 2 <= len(cycle) <= 8:
-                cycles.append(cycle)
+        # Optimization: directed cycles only exist within non-trivial SCCs (size >= 2)
+        sccs = [scc for scc in nx.strongly_connected_components(H) if len(scc) >= 2]
+        sccs.sort(key=len)
+        for scc in sccs:
+            sub_H = H.subgraph(scc)
+            for cycle in nx.simple_cycles(sub_H):
+                # Only multi-node mutual cycles (length >= 2)
+                if 2 <= len(cycle) <= 8:
+                    cycles.append(cycle)
+                if len(cycles) >= max_cycles:
+                    break
             if len(cycles) >= max_cycles:
                 break
         cycles.sort(key=len)
@@ -192,9 +199,7 @@ def _compute_extra_metrics(G: nx.DiGraph) -> dict[str, Any]:
         rel = d.get("relation", "unknown")
         relation_counts[rel] = relation_counts.get(rel, 0) + 1
     test_files = sum(
-        1
-        for n, d in G.nodes(data=True)
-        if d.get("type") == "file" and is_test_path(n)
+        1 for n, d in G.nodes(data=True) if d.get("type") == "file" and is_test_path(n)
     )
     return {
         "file_count": file_count,

@@ -120,3 +120,16 @@ class ResolutionContext:
     return_types: MappingProxyType  # MappingProxyType[str, str]
     """Read-only map of function/method node id → declared return type name.
     Used for multi-hop attribute chains such as ``o.inner().value()``."""
+
+    # ── fast precomputed indexes (read-only references) ────────────────────
+    class_like_symbols: MappingProxyType = MappingProxyType({})
+    """Read-only map of symbol label → list/tuple of class/struct/interface/enum node IDs."""
+
+    methods_by_class: MappingProxyType = MappingProxyType({})
+    """Read-only map of class node ID → {method_name: method_node_id}."""
+
+    dir_to_symbols: MappingProxyType = MappingProxyType({})
+    """Read-only map of directory path string → tuple of symbol node IDs (for package-level scope)."""
+
+    file_to_nodes: MappingProxyType = MappingProxyType({})
+    """Read-only map of source_file path string → tuple of contained node IDs."""

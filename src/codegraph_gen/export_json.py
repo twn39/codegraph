@@ -64,9 +64,7 @@ def graph_to_export_dict(
             "nodes": G.number_of_nodes(),
             "edges": G.number_of_edges(),
             "files": sum(1 for _, d in G.nodes(data=True) if d.get("type") == "file"),
-            "symbols": sum(
-                1 for _, d in G.nodes(data=True) if d.get("type") != "file"
-            ),
+            "symbols": sum(1 for _, d in G.nodes(data=True) if d.get("type") != "file"),
         },
         "nodes": nodes,
         "edges": edges,

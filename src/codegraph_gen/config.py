@@ -68,6 +68,7 @@ class CacheEntry(BaseModel):
     size: int
     hash: str
     result: ExtractionResult
+    mtime_ns: Optional[int] = None
 
 
 class ProjectConfig(BaseModel):

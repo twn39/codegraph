@@ -14,10 +14,10 @@ def build_graph(extractions: list[ExtractionResult], workspace_dir: Path) -> nx.
     """
     G = nx.DiGraph()
 
-    # 1. Add all nodes to the graph
-    for ext in extractions:
-        for node in ext.nodes:
-            G.add_node(node.id, **node.model_dump())
+    # 1. Add all nodes to the graph in batch
+    G.add_nodes_from(
+        (node.id, node.__dict__) for ext in extractions for node in ext.nodes
+    )
 
     # 2. Run Type Resolver (Two-pass type inference & scope/edge resolution)
     resolver = TypeResolver(G, extractions, workspace_dir)

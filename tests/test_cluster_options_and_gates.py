@@ -156,7 +156,9 @@ def test_max_unresolved_edges_gate(tmp_path: Path):
         max_unresolved_edges=0,
     )
     # Engine re-discovers files from disk; write matching sources with unresolved calls
-    (tmp_path / "a.py").write_text("def f():\n    nope1()\n    nope2()\n", encoding="utf-8")
+    (tmp_path / "a.py").write_text(
+        "def f():\n    nope1()\n    nope2()\n", encoding="utf-8"
+    )
     with pytest.raises(RuntimeError, match="Unresolved edges"):
         CodegraphEngine().run_pipeline(config)
 
@@ -217,9 +219,7 @@ func (s *Server) Start() {}
     method = next(n for n in result.nodes if n.label == "Start")
     assert method.id.endswith("Server.Start")
     contains = [
-        e
-        for e in result.edges
-        if e.relation == "contains" and e.target == method.id
+        e for e in result.edges if e.relation == "contains" and e.target == method.id
     ]
     assert contains
     assert "Server" in contains[0].source

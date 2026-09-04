@@ -1,5 +1,10 @@
+from __future__ import annotations
+
+import concurrent.futures
 import logging
+import os
 import shutil
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,22 +29,38 @@ class VaultWriter:
             except Exception as e:
                 logger.warning(f"Could not fully clear output directory {path}: {e}")
 
-    def write_file(self, path: Path, content: str, stats: WriteStats | None = None) -> bool:
+    def write_file(
+        self,
+        path: Path,
+        content: str,
+        stats: WriteStats | None = None,
+        lock: threading.Lock | None = None,
+    ) -> bool:
         """Write content if changed. Returns True when a write occurred."""
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.parent.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists():
                 try:
                     if path.read_text(encoding="utf-8") == content:
                         if stats is not None:
-                            stats.skipped += 1
+                            if lock:
+                                with lock:
+                                    stats.skipped += 1
+                            else:
+                                stats.skipped += 1
                         return False
                 except Exception:
                     pass
             path.write_text(content, encoding="utf-8")
             if stats is not None:
-                stats.written += 1
-                stats.paths_written.append(str(path))
+                if lock:
+                    with lock:
+                        stats.written += 1
+                        stats.paths_written.append(str(path))
+                else:
+                    stats.written += 1
+                    stats.paths_written.append(str(path))
             return True
         except Exception as e:
             logger.error(f"Failed to write file at {path}: {e}")
@@ -52,6 +73,8 @@ class VaultWriter:
         rendered_components: dict[str, str],
         readme_content: str,
         prompt_content: str,
+        skipped_nodes: set[str] | None = None,
+        skipped_components: set[str] | None = None,
     ) -> WriteStats:
         """Writes all rendered markdown pages; skips unchanged files."""
         stats = WriteStats()
@@ -61,8 +84,11 @@ class VaultWriter:
         nodes_dir.mkdir(parents=True, exist_ok=True)
         comps_dir.mkdir(parents=True, exist_ok=True)
 
+        skip_nodes = skipped_nodes or set()
+        skip_comps = skipped_components or set()
+
         # Smart cleanup of obsolete files to avoid deleting active cache.json or graph.html
-        expected_nodes = set(rendered_nodes.keys())
+        expected_nodes = set(rendered_nodes.keys()) | skip_nodes
         if nodes_dir.exists():
             for p in nodes_dir.glob("*.md"):
                 if p.name not in expected_nodes:
@@ -71,9 +97,11 @@ class VaultWriter:
                         stats.removed += 1
                         logger.info(f"Removed obsolete node file: {p.name}")
                     except Exception as e:
-                        logger.warning(f"Could not remove obsolete node file {p.name}: {e}")
+                        logger.warning(
+                            f"Could not remove obsolete node file {p.name}: {e}"
+                        )
 
-        expected_components = set(rendered_components.keys())
+        expected_components = set(rendered_components.keys()) | skip_comps
         if comps_dir.exists():
             for p in comps_dir.glob("*.md"):
                 if p.name not in expected_components:
@@ -82,13 +110,35 @@ class VaultWriter:
                         stats.removed += 1
                         logger.info(f"Removed obsolete component file: {p.name}")
                     except Exception as e:
-                        logger.warning(f"Could not remove obsolete component file {p.name}: {e}")
+                        logger.warning(
+                            f"Could not remove obsolete component file {p.name}: {e}"
+                        )
 
-        for fname, content in rendered_nodes.items():
-            self.write_file(nodes_dir / fname, content, stats)
+        # Account for skipped files with zero disk I/O
+        stats.skipped += len(skip_nodes) + len(skip_comps)
 
-        for fname, content in rendered_components.items():
-            self.write_file(comps_dir / fname, content, stats)
+        total_files_to_write = len(rendered_nodes) + len(rendered_components)
+        if total_files_to_write > 16:
+            max_workers = min(16, (os.cpu_count() or 1) * 2)
+            lock = threading.Lock()
+            tasks = [
+                (nodes_dir / fn, content) for fn, content in rendered_nodes.items()
+            ] + [
+                (comps_dir / fn, content) for fn, content in rendered_components.items()
+            ]
+
+            def _worker_task(item: tuple[Path, str]) -> None:
+                self.write_file(item[0], item[1], stats, lock=lock)
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers
+            ) as executor:
+                list(executor.map(_worker_task, tasks))
+        else:
+            for fname, content in rendered_nodes.items():
+                self.write_file(nodes_dir / fname, content, stats)
+            for fname, content in rendered_components.items():
+                self.write_file(comps_dir / fname, content, stats)
 
         self.write_file(output_dir / "README.md", readme_content, stats)
         self.write_file(output_dir / "AGENT_PROMPT.md", prompt_content, stats)

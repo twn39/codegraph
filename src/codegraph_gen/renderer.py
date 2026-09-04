@@ -1,18 +1,24 @@
+import functools
 import re
 from pathlib import Path
 import networkx as nx
 from codegraph_gen.analyzer import AnalysisResult
 
+_NODE_CLEAN_RE = re.compile(r'[\\/.: *?#^[\]"<>|]+')
+_COMP_CLEAN_RE = re.compile(r'[\\/.: *?#^[\]"<>|()]+')
 
+
+@functools.lru_cache(maxsize=65536)
 def get_node_filename(node_id: str) -> str:
     """Safely converts a node ID into a clean markdown filename."""
-    cleaned = re.sub(r'[\\/.: *?#^[\]"<>|]+', "_", node_id)
+    cleaned = _NODE_CLEAN_RE.sub("_", node_id)
     return cleaned + ".md"
 
 
+@functools.lru_cache(maxsize=16384)
 def get_component_filename(component_name: str) -> str:
     """Safely converts a component name into a clean markdown filename."""
-    cleaned = re.sub(r'[\\/.: *?#^[\]"<>|()]+', "_", component_name)
+    cleaned = _COMP_CLEAN_RE.sub("_", component_name)
     return cleaned + ".md"
 
 
@@ -362,7 +368,8 @@ class MarkdownRenderer:
 
         if analysis.metrics.get("relation_counts"):
             rel_parts = ", ".join(
-                f"{k}={v}" for k, v in sorted(analysis.metrics["relation_counts"].items())
+                f"{k}={v}"
+                for k, v in sorted(analysis.metrics["relation_counts"].items())
             )
             readme_lines.append(f"- **Relation Mix:** {rel_parts}")
 

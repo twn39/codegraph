@@ -239,10 +239,20 @@ class RustVisitor(VisitorMixin):
                             f"{full_path}::{sub_path}" if full_path else sub_path
                         )
                         last_symbol = item_path.split("::")[-1]
-                        self.emit_relation(self.file_node_id, item_path, "imports", import_map={alias_name: last_symbol})
+                        self.emit_relation(
+                            self.file_node_id,
+                            item_path,
+                            "imports",
+                            import_map={alias_name: last_symbol},
+                        )
                 else:
                     last_symbol = full_path.split("::")[-1]
-                    self.emit_relation(self.file_node_id, full_path, "imports", import_map={last_symbol: last_symbol})
+                    self.emit_relation(
+                        self.file_node_id,
+                        full_path,
+                        "imports",
+                        import_map={last_symbol: last_symbol},
+                    )
 
             elif n.type == "use_as_clause":
                 path_node = n.child_by_field_name("path")
@@ -252,16 +262,31 @@ class RustVisitor(VisitorMixin):
                     alias_name = self.get_text(alias_node)
                     full_path = f"{prefix}::{path_name}" if prefix else path_name
                     last_symbol = full_path.split("::")[-1]
-                    self.emit_relation(self.file_node_id, full_path, "imports", import_map={alias_name: last_symbol})
+                    self.emit_relation(
+                        self.file_node_id,
+                        full_path,
+                        "imports",
+                        import_map={alias_name: last_symbol},
+                    )
             elif n.type in ("identifier", "scoped_identifier"):
                 name = self.get_text(n)
                 full_path = f"{prefix}::{name}" if prefix else name
                 last_symbol = full_path.split("::")[-1]
-                self.emit_relation(self.file_node_id, full_path, "imports", import_map={last_symbol: last_symbol})
+                self.emit_relation(
+                    self.file_node_id,
+                    full_path,
+                    "imports",
+                    import_map={last_symbol: last_symbol},
+                )
             elif n.type == "self_literal":
                 full_path = prefix
                 last_symbol = full_path.split("::")[-1] if full_path else "self"
-                self.emit_relation(self.file_node_id, full_path, "imports", import_map={last_symbol: last_symbol})
+                self.emit_relation(
+                    self.file_node_id,
+                    full_path,
+                    "imports",
+                    import_map={last_symbol: last_symbol},
+                )
 
         for child in node.children:
             if child.type in (
