@@ -15,10 +15,12 @@
 
 ## 🚀 核心特性
 
-- **多语言 AST 解析**：基于 `tree-sitter`，原生支持 **Python, JavaScript, TypeScript, Kotlin, Go, Rust, Swift, C, C++**。
+- **多语言 AST 解析**：基于 `tree-sitter`，原生支持 **Python, JavaScript, TypeScript, Kotlin, Go, Rust, Swift, C, C++, OCaml, Dart**。
 - **语义边解析与绑定**：静态解析跨文件的函数/方法调用（`calls`）、类型继承/接口实现（`inherits`/`implements`）以及文件导入关系（`imports`）。
 - **逻辑组件自动聚类**：利用贪心模块度社区发现算法（Louvain Modularity Clustering）将紧密耦合的文件和符号自动聚类为 **Component（逻辑组件）**，并根据组件核心节点智能命名。
-- **架构脆弱性分析**：自动识别 **God Nodes（度数最高的核心抽象）**，并静态检测文件级别的 **循环导入依赖（Circular Imports）**。
+- **架构脆弱性分析**：自动识别 **God Nodes（度数最高的核心抽象）**，并静态检测文件级别的 **循环导入依赖（Circular Imports）** 与函数级相互调用环路。
+- **交互式拓扑可视化**：内置 Plotly 交互式引擎，支持在浏览器中拖拽、悬停探索代码库复杂依赖关系网络。
+- **高性能增量架构**：具备纳秒级 Stat-First 缓存、并行 AST 解析、零磁盘读增量渲染与倒排索引高保真符号解析。
 - **Agent 友好交互协议**：生成离线 Agent 提示词文件 `AGENT_PROMPT.md` 与规则文件 `AGENTS.md`，实现零 API 成本的 Agent 驱动型架构洞察分析。
 
 ---
@@ -33,7 +35,7 @@ flowchart LR
     Builder --> Cluster["cluster: 社区模块度聚类命名"]
     Cluster --> Analyze["analyze: 上帝节点与循环导入分析"]
     Analyze --> Export["export: 导出至 .codegraph/"]
-    Export --> Generate["生成 AGENT_PROMPT.md / AGENTS.md / README.md / nodes / components"]
+    Export --> Generate["生成 AGENT_PROMPT.md / AGENTS.md / graph.json / README.md / nodes / components"]
 ```
 
 ---
@@ -56,11 +58,11 @@ uv pip install codegraph-gen
 
 ### 注册 AI Agent 斜杠命令
 
-`codegraph-gen` 支持一键将 `/codegraph` 自定义斜杠命令注册到您的 AI Agent（如 Codex、Antigravity 或 Crush）的全局配置中：
+`codegraph-gen` 支持一键将 `/codegraph` 自定义斜杠命令注册到主流 AI Agent 平台（支持 `antigravity`, `cursor`, `claude`, `codex`, `crush`, `gemini`, `windsurf`）：
 
 ```bash
-# 为 Codex / Antigravity / Crush 注入 /codegraph 全局斜杠命令
-codegraph install --platform crush
+# 为指定的 AI Agent 注入 /codegraph 全局斜杠命令
+codegraph install --platform antigravity   # 或 claude, cursor, codex, crush, gemini, windsurf
 ```
 
 注册完成后，在对应的 Agent 终端中，您只需输入 `/codegraph` 即可全自动运行整个图谱的提取、分析与回写流程。
@@ -82,17 +84,33 @@ codegraph build . --output my_vault/
 
 # 排除指定文件夹
 codegraph build . --exclude extra_folder/ --exclude docs/
+
+# 禁用缓存进行完整强制全量构建
+codegraph build . --no-cache
+
+# CI 质量门禁：内部符号解析率低于 95% 时抛错阻断 CI
+codegraph build . --min-internal-resolve-rate 0.95
 ```
 
-### 2. 导出 vault 目录结构
+### 2. 交互式可视化图谱
 
-输出的 `.codegraph/` 是一个自包含的 Markdown 知识图谱数据库，结构如下：
+运行 `codegraph visualize` 生成交互式 HTML 拓扑图，并在浏览器中自动打开探索：
+
+```bash
+# 在浏览器中交互式查看依赖拓扑与组件聚类分布
+codegraph visualize .
+```
+
+### 3. 导出 vault 目录结构
+
+输出的 `.codegraph/` 是一个自包含的 Markdown 知识图谱数据库与结构化数据包，结构如下：
 
 ```
 .codegraph/
 ├── README.md               # 图谱主索引，包含统计、Mermaid 组件依赖图、上帝节点、循环依赖及 AI 架构洞察
 ├── AGENT_PROMPT.md         # 供外部 AI Agent 读取的架构分析提示词模版
 ├── AGENTS.md               # 外部 AI Agent 协同工作规则与导航指南
+├── graph.json              # 完整图谱的拓扑数据结构导出（包含全部节点、边与元数据）
 ├── components/             # 聚类生成的逻辑组件详情（如 Component_3_BaseParser_.md）
 └── nodes/                  # 所有物理文件和符号的详情（包含定义签名、双向调用链与 Mermaid 拓扑）
 ```
